@@ -160,6 +160,47 @@ def suggest_index_choice(columns):
             if norm_str(c) == w: return c
     return columns[0] if columns else None
 
+def auto_detect_header_start(path: Path, sheet_name: str, max_rows: int = 50):
+    """自动识别表头行和数据起始列"""
+    try:
+        df = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+            header=None,
+            nrows=max_rows,
+            engine="openpyxl",
+            dtype=str
+        ).fillna('')
+    except Exception:
+        return 1, 1
+
+    keywords = ["姓名", "名称", "工号", "号码", "电话", "时间", "地址", "金额"]
+    best_row, best_score = 0, -1
+
+    for idx, row in df.iterrows():
+        cells = [norm_str(c) for c in row.tolist()]
+        non_empty = [c for c in cells if c]
+        if not non_empty:
+            continue
+        non_empty_count = len(non_empty)
+        text_cells = [c for c in non_empty if not re.fullmatch(r"-?\d+(?:\.\d+)?", c)]
+        text_ratio = len(text_cells) / non_empty_count
+        keyword_hits = sum(1 for c in non_empty for kw in keywords if kw in c)
+        score = non_empty_count + text_ratio * 5 + keyword_hits * 10
+        if score > best_score:
+            best_score = score
+            best_row = idx
+
+    header_row = best_row + 1
+    header_cells = [norm_str(c) for c in df.iloc[best_row].tolist()]
+    start_col = 1
+    for j, val in enumerate(header_cells):
+        if val:
+            start_col = j + 1
+            break
+
+    return header_row, start_col
+
 class ComboDelegate(QStyledItemDelegate):
     """用于表格内嵌下拉框的代理"""
     def __init__(self, parent, options):
@@ -383,6 +424,19 @@ class MapperUI(QMainWindow):
         grid.addWidget(QLabel("数据起始列："), 2, 2); grid.addWidget(sp_startcol, 2, 3)
         grid.addWidget(btn_extract, 3, 0, 1, 4); grid.addWidget(preview_table, 4, 0, 1, 4)
 
+        def auto_detect(_=None):
+            p = le_path.text().strip()
+            sheet = cmb_sheet.currentText().strip()
+            if not p or not sheet:
+                return
+            try:
+                h, c = auto_detect_header_start(Path(p), sheet)
+                sp_header.setValue(h)
+                sp_startcol.setValue(c)
+                self._update_fields_and_preview(g, is_source)
+            except Exception:
+                pass
+
         def on_browse():
             path, _ = QFileDialog.getOpenFileName(self, "选择Excel文件", "", "Excel (*.xlsx *.xlsm)")
             if not path: return
@@ -390,8 +444,11 @@ class MapperUI(QMainWindow):
             try:
                 sheet_names = get_sheet_names_safely(Path(path))
                 cmb_sheet.clear(); cmb_sheet.addItems(sheet_names)
+                auto_detect()
             except Exception as e: QMessageBox.critical(self, "错误", f"无法读取工作表：\n{e}")
         btn_browse.clicked.connect(on_browse)
+
+        cmb_sheet.currentTextChanged.connect(auto_detect)
 
         def on_extract(): self._update_fields_and_preview(g, is_source)
         btn_extract.clicked.connect(on_extract)
