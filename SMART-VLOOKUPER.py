@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup
+    QButtonGroup, QTabWidget
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush, QColor
@@ -390,8 +390,9 @@ class MapperUI(QMainWindow):
 
         self.btn_add_src = QPushButton("添加信息源"); self.btn_add_src.clicked.connect(self.add_source_group)
         self.btn_add_tgt = QPushButton("添加目标表"); self.btn_add_tgt.clicked.connect(self.add_target_group)
-        self.src_layout.addWidget(self.btn_add_src)
-        self.tgt_layout.addWidget(self.btn_add_tgt)
+        self.src_tabs = QTabWidget(); self.tgt_tabs = QTabWidget()
+        self.src_layout.addWidget(self.btn_add_src); self.src_layout.addWidget(self.src_tabs)
+        self.tgt_layout.addWidget(self.btn_add_tgt); self.tgt_layout.addWidget(self.tgt_tabs)
 
         layout.addWidget(self.src_container, 1, 0)
         layout.addWidget(self.tgt_container, 1, 1)
@@ -436,14 +437,18 @@ class MapperUI(QMainWindow):
 
     # ---- 动态增减源/目标组 ----
     def add_source_group(self):
-        g = self._build_config_group(f"信息源{len(self.src_groups)+1}", is_source=True)
+        idx = len(self.src_groups) + 1
+        g = self._build_config_group(f"信息源{idx}", is_source=True)
         self.src_groups.append(g)
-        self.src_layout.insertWidget(self.src_layout.count()-1, g)
+        self.src_tabs.addTab(g, f"信息源{idx}")
+        self.src_tabs.setCurrentWidget(g)
 
     def add_target_group(self):
-        g = self._build_config_group(f"目标表{len(self.tgt_groups)+1}", is_source=False)
+        idx = len(self.tgt_groups) + 1
+        g = self._build_config_group(f"目标表{idx}", is_source=False)
         self.tgt_groups.append(g)
-        self.tgt_layout.insertWidget(self.tgt_layout.count()-1, g)
+        self.tgt_tabs.addTab(g, f"目标表{idx}")
+        self.tgt_tabs.setCurrentWidget(g)
 
     def on_mode_change(self):
         if self.rb_one2one.isChecked():
@@ -459,11 +464,15 @@ class MapperUI(QMainWindow):
         if self.mode != "many2one":
             while len(self.src_groups) > 1:
                 g = self.src_groups.pop()
-                g.setParent(None)
+                idx = self.src_tabs.count() - 1
+                self.src_tabs.removeTab(idx)
+                g.deleteLater()
         if self.mode != "one2many":
             while len(self.tgt_groups) > 1:
                 g = self.tgt_groups.pop()
-                g.setParent(None)
+                idx = self.tgt_tabs.count() - 1
+                self.tgt_tabs.removeTab(idx)
+                g.deleteLater()
 
         self._recalc_headers()
 
@@ -486,7 +495,10 @@ class MapperUI(QMainWindow):
         self.rebuild_mapping_table()
 
     def _build_config_group(self, title, is_source: bool):
-        g = QGroupBox(title); grid = QGridLayout(g)
+        g = QWidget(); grid = QGridLayout(g)
+        grid.setContentsMargins(6,6,6,6)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
         le_path = QLineEdit(); le_path.setReadOnly(True)
         btn_browse = QPushButton("浏览…")
         cmb_sheet = QComboBox()
@@ -780,6 +792,9 @@ class MapperUI(QMainWindow):
             QHeaderView::section { background: #0b1220; color: #cbd5e1; padding: 6px; border: none; }
             QTableWidget { gridline-color: #374151; }
             QTableWidget::item { padding-left: 5px; }
+            QTabWidget::pane { border: 1px solid #1f2937; border-radius: 10px; } 
+            QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; } 
+            QTabBar::tab:selected { background: #2563eb; color: white; }
         """)
 
 def main():
