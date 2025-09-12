@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup
+    QButtonGroup, QTabWidget
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush, QColor
@@ -358,11 +358,10 @@ class MapperUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("智能Vlookuper 1.0.1 -梁诗忻开发")
         self.resize(1200, 820)
-        self.src_path, self.tgt_path = None, None
-        self.src_sheet, self.tgt_sheet = None, None
-        self.src_header_row, self.tgt_header_row = 1, 1
-        self.src_data_start_col, self.tgt_data_start_col = 1, 1
+        # 多表模式下，源表和目标表都可能有多个，通过列表维护
+        self.src_groups, self.tgt_groups = [], []
         self.src_headers, self.tgt_headers = [], []
+        self.mode = "one2one"  # 默认一对一
         self._init_ui()
         self._apply_style()
 
@@ -371,9 +370,36 @@ class MapperUI(QMainWindow):
         layout = QGridLayout(central)
         layout.setContentsMargins(14, 12, 14, 12); layout.setSpacing(12)
 
-        self.grp_src = self._build_config_group("信息源", is_source=True)
-        self.grp_tgt = self._build_config_group("目标表", is_source=False)
-        layout.addWidget(self.grp_src, 0, 0); layout.addWidget(self.grp_tgt, 0, 1)
+        # ------ 模式选择 ------
+        mode_box = QGroupBox("匹配模式")
+        mode_layout = QHBoxLayout(mode_box)
+        self.rb_one2one = QRadioButton("一对一"); self.rb_one2one.setChecked(True)
+        self.rb_one2many = QRadioButton("一对多")
+        self.rb_many2one = QRadioButton("多对一")
+        mode_layout.addWidget(self.rb_one2one); mode_layout.addWidget(self.rb_one2many); mode_layout.addWidget(self.rb_many2one)
+        self.rb_one2one.toggled.connect(self.on_mode_change)
+        self.rb_one2many.toggled.connect(self.on_mode_change)
+        self.rb_many2one.toggled.connect(self.on_mode_change)
+        layout.addWidget(mode_box, 0, 0, 1, 2)
+
+        # ------ 动态源/目标面板 ------
+        self.src_container = QWidget(); self.src_layout = QVBoxLayout(self.src_container)
+        self.src_layout.setContentsMargins(0,0,0,0); self.src_layout.setSpacing(6)
+        self.tgt_container = QWidget(); self.tgt_layout = QVBoxLayout(self.tgt_container)
+        self.tgt_layout.setContentsMargins(0,0,0,0); self.tgt_layout.setSpacing(6)
+
+        self.btn_add_src = QPushButton("添加信息源"); self.btn_add_src.clicked.connect(self.add_source_group)
+        self.btn_add_tgt = QPushButton("添加目标表"); self.btn_add_tgt.clicked.connect(self.add_target_group)
+        self.src_tabs = QTabWidget(); self.tgt_tabs = QTabWidget()
+        self.src_layout.addWidget(self.btn_add_src); self.src_layout.addWidget(self.src_tabs)
+        self.tgt_layout.addWidget(self.btn_add_tgt); self.tgt_layout.addWidget(self.tgt_tabs)
+
+        layout.addWidget(self.src_container, 1, 0)
+        layout.addWidget(self.tgt_container, 1, 1)
+
+        # 初始各添加一个组
+        self.add_source_group()
+        self.add_target_group()
 
         map_grp = QGroupBox("字段映射与执行")
         map_layout = QVBoxLayout(map_grp)
@@ -400,16 +426,79 @@ class MapperUI(QMainWindow):
         btns.addStretch(); btns.addWidget(self.btn_auto); btns.addWidget(self.btn_run)
         
         map_layout.addWidget(self.map_table); map_layout.addLayout(opts_layout); map_layout.addLayout(btns)
-        layout.addWidget(map_grp, 1, 0, 1, 2)
+        layout.addWidget(map_grp, 2, 0, 1, 2)
 
         self.btn_load_config.clicked.connect(self.load_mapping_config)
         self.btn_save_config.clicked.connect(self.save_mapping_config)
         self.btn_auto.clicked.connect(self.auto_fill_mapping)
         self.btn_run.clicked.connect(self.run_and_export)
+        self.on_mode_change()
         self.setCentralWidget(central)
 
+    # ---- 动态增减源/目标组 ----
+    def add_source_group(self):
+        idx = len(self.src_groups) + 1
+        g = self._build_config_group(f"信息源{idx}", is_source=True)
+        self.src_groups.append(g)
+        self.src_tabs.addTab(g, f"信息源{idx}")
+        self.src_tabs.setCurrentWidget(g)
+
+    def add_target_group(self):
+        idx = len(self.tgt_groups) + 1
+        g = self._build_config_group(f"目标表{idx}", is_source=False)
+        self.tgt_groups.append(g)
+        self.tgt_tabs.addTab(g, f"目标表{idx}")
+        self.tgt_tabs.setCurrentWidget(g)
+
+    def on_mode_change(self):
+        if self.rb_one2one.isChecked():
+            self.mode = "one2one"
+        elif self.rb_one2many.isChecked():
+            self.mode = "one2many"
+        else:
+            self.mode = "many2one"
+
+        self.btn_add_src.setEnabled(self.mode == "many2one")
+        self.btn_add_tgt.setEnabled(self.mode == "one2many")
+
+        if self.mode != "many2one":
+            while len(self.src_groups) > 1:
+                g = self.src_groups.pop()
+                idx = self.src_tabs.count() - 1
+                self.src_tabs.removeTab(idx)
+                g.deleteLater()
+        if self.mode != "one2many":
+            while len(self.tgt_groups) > 1:
+                g = self.tgt_groups.pop()
+                idx = self.tgt_tabs.count() - 1
+                self.tgt_tabs.removeTab(idx)
+                g.deleteLater()
+
+        self._recalc_headers()
+
+    def _recalc_headers(self):
+        self.src_headers = []
+        for g in self.src_groups:
+            if hasattr(g, "_headers"):
+                for h in g._headers:
+                    if h not in self.src_headers:
+                        self.src_headers.append(h)
+        self.cmb_src_index.clear()
+        if self.src_headers:
+            self.cmb_src_index.addItems(self.src_headers)
+
+        self.tgt_headers = []
+        if self.tgt_groups and hasattr(self.tgt_groups[0], "_headers"):
+            self.tgt_headers = self.tgt_groups[0]._headers
+            self.cmb_tgt_index.clear(); self.cmb_tgt_index.addItems(self.tgt_headers)
+
+        self.rebuild_mapping_table()
+
     def _build_config_group(self, title, is_source: bool):
-        g = QGroupBox(title); grid = QGridLayout(g)
+        g = QWidget(); grid = QGridLayout(g)
+        grid.setContentsMargins(6,6,6,6)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
         le_path = QLineEdit(); le_path.setReadOnly(True)
         btn_browse = QPushButton("浏览…")
         cmb_sheet = QComboBox()
@@ -469,16 +558,23 @@ class MapperUI(QMainWindow):
             self._update_preview_table(group_box._preview_table, df)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"提取字段失败：\n{e}"); return
-        
-        if is_source:
-            self.src_path, self.src_sheet, self.src_header_row, self.src_data_start_col, self.src_headers = path, sheet, header_row, start_col, headers
-            self.cmb_src_index.clear(); self.cmb_src_index.addItems(headers)
-            if (guess := suggest_index_choice(headers)): self.cmb_src_index.setCurrentText(guess)
-        else:
-            self.tgt_path, self.tgt_sheet, self.tgt_header_row, self.tgt_data_start_col, self.tgt_headers = path, sheet, header_row, start_col, headers
-            self.cmb_tgt_index.clear(); self.cmb_tgt_index.addItems(headers)
-            if (guess := suggest_index_choice(headers)): self.cmb_tgt_index.setCurrentText(guess)
-        self.rebuild_mapping_table()
+
+        group_box._path, group_box._sheet = path, sheet
+        group_box._header_row, group_box._start_col = header_row, start_col
+        group_box._headers = headers
+
+        if (not is_source) and self.tgt_groups and group_box != self.tgt_groups[0]:
+            if hasattr(self.tgt_groups[0], "_headers") and headers != self.tgt_groups[0]._headers:
+                QMessageBox.warning(self, "警告", "目标表字段结构不一致，可能导致匹配问题。")
+
+        self._recalc_headers()
+
+        if is_source and self.src_headers:
+            if (guess := suggest_index_choice(self.src_headers)):
+                self.cmb_src_index.setCurrentText(guess)
+        if (not is_source) and self.tgt_headers:
+            if (guess := suggest_index_choice(self.tgt_headers)):
+                self.cmb_tgt_index.setCurrentText(guess)
 
     def _update_preview_table(self, table: QTableWidget, df: pd.DataFrame):
         preview_df = df.head(5)
@@ -529,12 +625,18 @@ class MapperUI(QMainWindow):
                 item_src.setBackground(unmatched_color)
 
     def save_mapping_config(self):
-        if not self.src_path or not self.tgt_path: QMessageBox.warning(self, "提示", "请先配置并提取信息源和目标表的字段。"); return
-        
+        if self.mode != "one2one":
+            QMessageBox.information(self, "提示", "仅一对一模式支持保存方案。")
+            return
+
+        g_src, g_tgt = self.src_groups[0], self.tgt_groups[0]
+        if not hasattr(g_src, "_path") or not hasattr(g_tgt, "_path"):
+            QMessageBox.warning(self, "提示", "请先配置并提取信息源和目标表的字段。"); return
+
         mapping = {self.map_table.item(r, 0).text(): self.map_table.item(r, 1).text() for r in range(self.map_table.rowCount())}
         config = {
-            "source": {"path": str(self.src_path), "sheet": self.src_sheet, "header_row": self.src_header_row, "start_col": self.src_data_start_col},
-            "target": {"path": str(self.tgt_path), "sheet": self.tgt_sheet, "header_row": self.tgt_header_row, "start_col": self.tgt_data_start_col},
+            "source": {"path": str(g_src._path), "sheet": g_src._sheet, "header_row": g_src._header_row, "start_col": g_src._start_col},
+            "target": {"path": str(g_tgt._path), "sheet": g_tgt._sheet, "header_row": g_tgt._header_row, "start_col": g_tgt._start_col},
             "indices": {"source": self.cmb_src_index.currentText(), "target": self.cmb_tgt_index.currentText()},
             "write_mode": "overwrite" if self.rb_overwrite.isChecked() else "fill_empty", "mapping": mapping
         }
@@ -546,12 +648,16 @@ class MapperUI(QMainWindow):
             except Exception as e: QMessageBox.critical(self, "错误", f"保存失败：\n{e}")
 
     def load_mapping_config(self):
+        if self.mode != "one2one":
+            QMessageBox.information(self, "提示", "仅在一对一模式下可加载方案。")
+            return
+
         path, _ = QFileDialog.getOpenFileName(self, "加载映射方案", "", "JSON Files (*.json)")
         if not path: return
         try:
             with open(path, 'r', encoding='utf-8') as f: config = json.load(f)
-            
-            for g, cfg in [(self.grp_src, config["source"]), (self.grp_tgt, config["target"])]:
+
+            for g, cfg in [(self.src_groups[0], config["source"]), (self.tgt_groups[0], config["target"])]:
                 g._le_path.setText(cfg["path"])
                 g._sp_header.setValue(cfg["header_row"])
                 g._sp_startcol.setValue(cfg["start_col"])
@@ -560,10 +666,10 @@ class MapperUI(QMainWindow):
                     g._cmb_sheet.clear(); g._cmb_sheet.addItems(sheet_names)
                     g._cmb_sheet.setCurrentText(cfg["sheet"])
                 except Exception as e: QMessageBox.warning(self, "警告", f"无法加载工作表 {cfg['path']}: {e}")
-            
-            self._update_fields_and_preview(self.grp_src, True)
-            self._update_fields_and_preview(self.grp_tgt, False)
-            
+
+            self._update_fields_and_preview(self.src_groups[0], True)
+            self._update_fields_and_preview(self.tgt_groups[0], False)
+
             self.cmb_src_index.setCurrentText(config["indices"]["source"])
             self.cmb_tgt_index.setCurrentText(config["indices"]["target"])
             self.rb_overwrite.setChecked(config["write_mode"] == "overwrite")
@@ -588,65 +694,88 @@ class MapperUI(QMainWindow):
             self.setEnabled(True)
 
     def _execute_matching_logic(self):
-        if not (self.src_path and self.tgt_path and self.src_headers and self.tgt_headers):
+        if not (self.src_groups and self.tgt_groups and self.src_headers and self.tgt_headers):
             QMessageBox.warning(self, "提示", "请先提取信息源和目标表的字段。"); return
         src_idx, tgt_idx = self.cmb_src_index.currentText(), self.cmb_tgt_index.currentText()
-        if not src_idx or not tgt_idx: QMessageBox.warning(self, "提示", "请选择索引字段。"); return
-        
+        if not src_idx or not tgt_idx:
+            QMessageBox.warning(self, "提示", "请选择索引字段。"); return
+
         mapping = [(self.map_table.item(r,0).text(), self.map_table.item(r,1).text()) for r in range(self.map_table.rowCount())]
         mapping = [(t, s) for t, s in mapping if s != "<跳过>"]
-        
-        try:
-            df_src = read_excel_dataframe(self.src_path, self.src_sheet, self.src_header_row, self.src_data_start_col, True)
-            df_tgt = read_excel_dataframe(self.tgt_path, self.tgt_sheet, self.tgt_header_row, self.tgt_data_start_col, False)
-        except Exception as e: QMessageBox.critical(self, "错误", f"读取数据失败：\n{e}"); return
-        
-        if src_idx not in df_src.columns: QMessageBox.critical(self, "错误", f"源表无索引：{src_idx}"); return
-        if tgt_idx not in df_tgt.columns: QMessageBox.critical(self, "错误", f"目标表无索引：{tgt_idx}"); return
 
+        # ---- 构建源数据 ----
+        try:
+            if self.mode == "many2one":
+                dfs = [read_excel_dataframe(g._path, g._sheet, g._header_row, g._start_col, True) for g in self.src_groups]
+                df_src = pd.concat(dfs, ignore_index=True)
+            else:
+                g = self.src_groups[0]
+                df_src = read_excel_dataframe(g._path, g._sheet, g._header_row, g._start_col, True)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取信息源失败：\n{e}"); return
+
+        if src_idx not in df_src.columns:
+            QMessageBox.critical(self, "错误", f"源表无索引：{src_idx}"); return
         df_src["_IDX_"] = df_src[src_idx].apply(norm_str)
-        df_tgt["_IDX_"] = df_tgt[tgt_idx].apply(norm_str)
         src_map = df_src.drop_duplicates(subset=["_IDX_"], keep='last').set_index("_IDX_")
-        
-        tgt_field_to_col = {name: i + self.tgt_data_start_col for i, name in enumerate(self.tgt_headers)}
-        overwrite_all = self.rb_overwrite.isChecked()
-        out_path = self.tgt_path.with_name(f"{self.tgt_path.stem}_匹配输出{self.tgt_path.suffix}")
 
-        try:
-            total_found, total_write = excel_com_write_and_save_optimized(
-                self.tgt_path, self.tgt_sheet, out_path, df_src, df_tgt, src_map, 
-                mapping, tgt_field_to_col, self.tgt_header_row + 1, overwrite_all)
-            engine = "Excel COM（批量优化）"
-        except Exception as e1:
+        results = []
+        for tgt_g in self.tgt_groups:
             try:
-                total_found, total_write = openpyxl_write_and_save_optimized(
-                    self.tgt_path, self.tgt_sheet, out_path, df_src, df_tgt, src_map, 
-                    mapping, tgt_field_to_col, self.tgt_header_row + 1, overwrite_all)
-                engine = "openpyxl（Office365兼容）"
-                
-                # 【关键修复】使用'replace'模式安全地进行Pandas验证回写
-                try:
-                    df_verify = pd.read_excel(out_path, sheet_name=self.tgt_sheet, dtype=str).fillna('')
-                    with pd.ExcelWriter(
-                        out_path,
-                        engine='openpyxl',
-                        mode='a',
-                        if_sheet_exists='replace'
-                    ) as writer:
-                        df_verify.to_excel(writer, sheet_name=self.tgt_sheet, index=False)
-                    engine = "openpyxl（Pandas兼容性优化）"
-                except Exception:
-                    # 验证失败，但原文件可能仍然可用
-                    pass
+                df_tgt = read_excel_dataframe(tgt_g._path, tgt_g._sheet, tgt_g._header_row, tgt_g._start_col, False)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"读取目标表失败：\n{e}"); return
+            if tgt_idx not in df_tgt.columns:
+                QMessageBox.critical(self, "错误", f"目标表无索引：{tgt_idx}"); return
+            df_tgt["_IDX_"] = df_tgt[tgt_idx].apply(norm_str)
+            tgt_field_to_col = {name: i + tgt_g._start_col for i, name in enumerate(self.tgt_headers)}
+            overwrite_all = self.rb_overwrite.isChecked()
+            out_path = Path(tgt_g._path).with_name(f"{Path(tgt_g._path).stem}_匹配输出{Path(tgt_g._path).suffix}")
 
-            except Exception as e2: 
-                QMessageBox.critical(self, "错误", f"所有保存方式均失败：\n\nCOM错误：{str(e1)[:200]}...\n\nopenpyxl错误：{str(e2)[:200]}...\n\n建议：\n1. 确保目标Excel文件未被其他程序占用\n2. 检查文件权限\n3. 尝试关闭Excel程序后重试"); return
-        
-        QMessageBox.information(self, "完成", 
-            f"匹配完成（引擎：{engine}）：\n\n"
-            f"命中索引记录： {total_found}\n"
-            f"共写入单元格： {total_write}\n\n"
-            f"结果已导出至：\n{out_path}")
+            try:
+                total_found, total_write = excel_com_write_and_save_optimized(
+                    tgt_g._path, tgt_g._sheet, out_path, df_src, df_tgt, src_map,
+                    mapping, tgt_field_to_col, tgt_g._header_row + 1, overwrite_all)
+                engine = "Excel COM（批量优化）"
+            except Exception as e1:
+                try:
+                    total_found, total_write = openpyxl_write_and_save_optimized(
+                        tgt_g._path, tgt_g._sheet, out_path, df_src, df_tgt, src_map,
+                        mapping, tgt_field_to_col, tgt_g._header_row + 1, overwrite_all)
+                    engine = "openpyxl（Office365兼容）"
+
+                    # 【关键修复】使用'replace'模式安全地进行Pandas验证回写
+                    try:
+                        df_verify = pd.read_excel(out_path, sheet_name=tgt_g._sheet, dtype=str).fillna('')
+                        with pd.ExcelWriter(
+                            out_path,
+                            engine='openpyxl',
+                            mode='a',
+                            if_sheet_exists='replace'
+                        ) as writer:
+                            df_verify.to_excel(writer, sheet_name=tgt_g._sheet, index=False)
+                        engine = "openpyxl（Pandas兼容性优化）"
+                    except Exception:
+                        # 验证失败，但原文件可能仍然可用
+                        pass
+
+                except Exception as e2:
+                    QMessageBox.critical(self, "错误", f"所有保存方式均失败：\n\nCOM错误：{str(e1)[:200]}...\n\nopenpyxl错误：{str(e2)[:200]}...\n\n建议：\n1. 确保目标Excel文件未被其他程序占用\n2. 检查文件权限\n3. 尝试关闭Excel程序后重试"); return
+
+            results.append((out_path, engine, total_found, total_write))
+
+        if not results:
+            return
+        if len(results) == 1:
+            out_path, engine, total_found, total_write = results[0]
+            QMessageBox.information(self, "完成",
+                f"匹配完成（引擎：{engine}）：\n\n"
+                f"命中索引记录： {total_found}\n"
+                f"共写入单元格： {total_write}\n\n"
+                f"结果已导出至：\n{out_path}")
+        else:
+            msg = "\n\n".join([f"{p}: 命中{f} 写入{w}" for p, _, f, w in results])
+            QMessageBox.information(self, "完成", f"已处理{len(results)}个目标表：\n\n{msg}")
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -663,6 +792,9 @@ class MapperUI(QMainWindow):
             QHeaderView::section { background: #0b1220; color: #cbd5e1; padding: 6px; border: none; }
             QTableWidget { gridline-color: #374151; }
             QTableWidget::item { padding-left: 5px; }
+            QTabWidget::pane { border: 1px solid #1f2937; border-radius: 10px; } 
+            QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; } 
+            QTabBar::tab:selected { background: #2563eb; color: white; }
         """)
 
 def main():
