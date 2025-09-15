@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-通用字段映射与匹配工具（PyQt6） - v2.5
-- 修复：修正了Pandas验证回写的逻辑，采用更安全的 'replace' 模式，防止文件损坏
-- 新增：引入模糊匹配逻辑，增强“自动预填”的智能化程度
-- 优化：COM批量写入，大幅提升性能（按列批量写入，而非逐格）
-- 修复：加强异常处理和资源释放，确保文件句柄安全关闭
-- 改进：更清晰的视觉反馈，自动匹配行会高亮显示
+SMART-VLOOKUPER - Excel 字段匹配与 AI 自动化工具 (PyQt6)
 
-依赖: pip install pyqt6 pandas openpyxl pywin32 thefuzz
+主要功能：
+- 模糊字段匹配与 COM 批量写入，自动保留原有单元格格式
+- 内置 AI 助手：上传表格并描述需求后，实时预览流式生成的 Python 代码并在沙箱中执行
+- 失败重试与可取消的进度提示，确保最终产出可正常打开的 Excel 文件
+
+依赖：pip install pyqt6 pandas openpyxl pywin32 thefuzz
 """
 
 import sys, os, re, warnings, json, subprocess, tempfile, threading
@@ -394,7 +394,10 @@ class AIWorker(QThread):
                     if self.isInterruptionRequested():
                         self.error.emit("已取消")
                         return
-                    delta = chunk.choices[0].delta.get("content", "")
+                    # Each streamed token arrives as a ChoiceDelta object; get its text safely
+                    delta_obj = chunk.choices[0].delta
+                    delta = getattr(delta_obj, "content", None)
+
                     if delta:
                         code += delta
                         self.code_stream.emit(code)
@@ -560,6 +563,7 @@ class AIHelperDialog(QDialog):
 
         btn_cancel.clicked.connect(cancel_all)
         code_dlg.rejected.connect(cancel_all)
+
         btn_exec.clicked.connect(lambda: (self.worker.approve_execution(), code_dlg.accept()))
 
         def update_code(text: str):
@@ -568,10 +572,25 @@ class AIHelperDialog(QDialog):
             sb.setValue(sb.maximum())
 
         self.worker.code_stream.connect(update_code)
-        self.worker.code_ready.connect(lambda c: (update_code(c), btn_exec.setEnabled(True)))
+
+        def on_code_ready(c: str):
+            update_code(c)
+            btn_exec.setEnabled(True)
+            progress.hide()
+
+        self.worker.code_ready.connect(on_code_ready)
+
 
         code_dlg.show()
         progress.show()
+
+        def exec_and_show_progress():
+            progress.setLabelText("执行中...")
+            progress.show()
+            self.worker.approve_execution()
+            code_dlg.accept()
+
+        btn_exec.clicked.connect(exec_and_show_progress)
 
         def on_success(path):
             progress.close()
