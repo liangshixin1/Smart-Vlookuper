@@ -20,12 +20,13 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup, QTabWidget
+    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QBrush, QColor
 import gc
 from thefuzz import fuzz
+from copy import copy
 
 # —— 静默 openpyxl 的数据验证扩展警告 ——
 warnings.filterwarnings(
@@ -301,6 +302,126 @@ def excel_com_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path:
     
     return total_found, total_write
 
+# ===================== AI 助手 =====================
+
+class AIHelperDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI助手")
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("API Key:"))
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("DeepSeek API Key")
+        layout.addWidget(self.api_key_edit)
+
+        layout.addWidget(QLabel("使用场景:"))
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.addItems([
+            "代码生成/数学解题",
+            "数据抽取/分析",
+            "通用对话",
+            "翻译",
+            "创意类写作/诗歌创作"
+        ])
+        layout.addWidget(self.scenario_combo)
+
+        self.btn_add_table = QPushButton("添加表格")
+        self.btn_add_table.clicked.connect(self.add_table)
+        layout.addWidget(self.btn_add_table)
+
+        self.table_list = QListWidget()
+        layout.addWidget(self.table_list)
+
+        layout.addWidget(QLabel("需求说明:"))
+        self.instruction_edit = QPlainTextEdit()
+        self.instruction_edit.setPlaceholderText("请用自然语言描述您的需求")
+        layout.addWidget(self.instruction_edit)
+
+        self.btn_run = QPushButton("执行")
+        self.btn_run.clicked.connect(self.run_ai)
+        layout.addWidget(self.btn_run)
+
+        self.tables = []
+
+    def add_table(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择表格", "", "Excel Files (*.xlsx *.xlsm *.xls)")
+        if paths:
+            self.tables.extend(paths)
+            for p in paths:
+                self.table_list.addItem(p)
+
+    def run_ai(self):
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "提示", "请填写API Key")
+            return
+        if not self.tables:
+            QMessageBox.warning(self, "提示", "请至少添加一个表格")
+            return
+        instruction = self.instruction_edit.toPlainText().strip()
+        if not instruction:
+            QMessageBox.warning(self, "提示", "请填写需求说明")
+            return
+
+        temp_map = {
+            "代码生成/数学解题": 0.0,
+            "数据抽取/分析": 1.0,
+            "通用对话": 1.3,
+            "翻译": 1.3,
+            "创意类写作/诗歌创作": 1.5
+        }
+        temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
+
+        table_texts = []
+        for p in self.tables:
+            try:
+                df = pd.read_excel(p)
+                table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"读取表格失败: {p}\n{e}")
+                return
+
+        prompt = (
+            "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
+            "\n\n用户需求：\n" + instruction +
+            "\n\n请仅返回纯粹的Python代码，不要包含任何解释。"
+        )
+
+        try:
+            from openai import OpenAI
+            import io, contextlib
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"未安装openai库: {e}")
+            return
+
+        try:
+            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant"},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False
+            )
+            code = response.choices[0].message.content.strip()
+            if code.startswith("```"):
+                code = "\n".join(code.splitlines()[1:-1])
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"调用API失败：{e}")
+            return
+
+        try:
+            local_vars = {}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                exec(code, {"pd": pd, "Path": Path}, local_vars)
+            QMessageBox.information(self, "执行完成", f"输出：\n{buf.getvalue()}")
+        except Exception as e:
+            QMessageBox.critical(self, "执行失败", str(e))
+
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
                                     mapping: list, tgt_field_to_col: dict, tgt_data_start_row: int,
@@ -338,7 +459,22 @@ def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: 
         
         for tgt_col, updates in updates_by_col.items():
             for excel_row, val in updates:
-                ws.cell(row=excel_row, column=tgt_col).value = val
+                cell = ws.cell(row=excel_row, column=tgt_col)
+                fmt = {
+                    'font': copy(cell.font),
+                    'fill': copy(cell.fill),
+                    'border': copy(cell.border),
+                    'alignment': copy(cell.alignment),
+                    'number_format': cell.number_format,
+                    'protection': copy(cell.protection)
+                }
+                cell.value = val
+                cell.font = fmt['font']
+                cell.fill = fmt['fill']
+                cell.border = fmt['border']
+                cell.alignment = fmt['alignment']
+                cell.number_format = fmt['number_format']
+                cell.protection = fmt['protection']
                 total_write += 1
         
         wb.save(out_path)
@@ -364,6 +500,7 @@ class MapperUI(QMainWindow):
         self.mode = "one2one"  # 默认一对一
         self._init_ui()
         self._apply_style()
+        self._init_ai_button()
 
     def _init_ui(self):
         central = QWidget()
@@ -776,6 +913,30 @@ class MapperUI(QMainWindow):
         else:
             msg = "\n\n".join([f"{p}: 命中{f} 写入{w}" for p, _, f, w in results])
             QMessageBox.information(self, "完成", f"已处理{len(results)}个目标表：\n\n{msg}")
+
+    def _init_ai_button(self):
+        self.btn_ai = QPushButton("AI", self)
+        self.btn_ai.setFixedSize(48, 48)
+        self.btn_ai.setStyleSheet(
+            "QPushButton {background:#f97316; color:white; border:none; border-radius:24px;}"
+            "QPushButton:hover {background:#ea580c;}"
+        )
+        self.btn_ai.clicked.connect(self.show_ai_dialog)
+        self._position_ai_button()
+
+    def _position_ai_button(self):
+        x = self.width() - self.btn_ai.width() - 20
+        y = self.height() - self.btn_ai.height() - 20
+        self.btn_ai.move(x, y)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'btn_ai'):
+            self._position_ai_button()
+
+    def show_ai_dialog(self):
+        dlg = AIHelperDialog(self)
+        dlg.exec()
 
     def _apply_style(self):
         self.setStyleSheet("""
