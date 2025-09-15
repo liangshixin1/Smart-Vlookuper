@@ -319,43 +319,76 @@ class AIWorker(QThread):
     def run(self):
         try:
             from openai import OpenAI
-            import io, contextlib
+            import io, contextlib, traceback
         except Exception as e:
             self.error.emit(f"未安装openai库: {e}")
             return
-        try:
-            self.progress.emit("读取表格...")
-            table_texts = []
-            for p in self.tables:
-                df = pd.read_excel(p)
-                table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
-            prompt = (
-                "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
-                "\n\n用户需求：\n" + self.instruction +
-                "\n\n请仅返回纯粹的Python代码，不要包含任何解释。"
-            )
-            self.progress.emit("调用模型...")
-            client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                temperature=self.temperature,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant"},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=False
-            )
+
+        self.progress.emit("读取表格...")
+        table_texts = []
+        for p in self.tables:
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
+            df = pd.read_excel(p)
+            table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
+
+        base_prompt = (
+            "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
+            "\n\n用户需求：\n" + self.instruction +
+            "\n\n请生成Python代码，该代码必须将处理结果保存为Excel文件（xlsx）并使用print输出其绝对路径，且不要包含任何解释。"
+        )
+
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        attempt, last_err = 0, None
+        while attempt < 3:
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
+
+            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：\n{last_err}\n请修正后仅返回Python代码。"
+            self.progress.emit(f"调用模型...尝试{attempt + 1}/3")
+            try:
+                response = client.chat.completions.create(
+                    model="deepseek-chat",
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    stream=False
+                )
+            except Exception as e:
+                self.error.emit(str(e))
+                return
+
             code = response.choices[0].message.content.strip()
             if code.startswith("```"):
                 code = "\n".join(code.splitlines()[1:-1])
+
             self.progress.emit("执行代码...")
             local_vars = {}
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                exec(code, {"pd": pd, "Path": Path}, local_vars)
-            self.success.emit(buf.getvalue())
-        except Exception as e:
-            self.error.emit(str(e))
+            try:
+                with contextlib.redirect_stdout(buf):
+                    exec(code, {"pd": pd, "Path": Path}, local_vars)
+                output = buf.getvalue().strip()
+                out_path = Path(output)
+                if out_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"] and out_path.exists():
+                    try:
+                        load_workbook(out_path).close()
+                        self.success.emit(str(out_path))
+                        return
+                    except Exception as e:
+                        last_err = f"生成的文件无法打开: {e}"
+                else:
+                    last_err = f"代码未输出Excel文件路径，输出为: {output}"
+            except Exception:
+                last_err = traceback.format_exc()
+
+            attempt += 1
+
+        self.error.emit(last_err or "执行失败")
 
 
 class AIHelperDialog(QDialog):
@@ -428,18 +461,19 @@ class AIHelperDialog(QDialog):
         temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
 
         self.btn_run.setEnabled(False)
-        progress = QProgressDialog("准备中...", None, 0, 0, self)
+        progress = QProgressDialog("准备中...", "取消", 0, 0, self)
         progress.setWindowTitle("执行中")
-        progress.setCancelButton(None)
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.show()
 
         self.worker = AIWorker(api_key, self.tables, instruction, temperature)
+        progress.canceled.connect(lambda: self.worker.requestInterruption())
+        progress.canceled.connect(progress.close)
         self.worker.progress.connect(progress.setLabelText)
+        progress.show()
 
-        def on_success(text):
+        def on_success(path):
             progress.close()
-            QMessageBox.information(self, "执行完成", f"输出：\n{text}")
+            QMessageBox.information(self, "执行完成", f"已生成文件：\n{path}")
 
         def on_error(err):
             progress.close()
