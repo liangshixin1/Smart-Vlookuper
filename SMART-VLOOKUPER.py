@@ -20,9 +20,9 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit
+    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit, QProgressDialog
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 import gc
 from thefuzz import fuzz
@@ -304,6 +304,60 @@ def excel_com_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path:
 
 # ===================== AI 助手 =====================
 
+class AIWorker(QThread):
+    progress = pyqtSignal(str)
+    success = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, api_key, tables, instruction, temperature):
+        super().__init__()
+        self.api_key = api_key
+        self.tables = tables
+        self.instruction = instruction
+        self.temperature = temperature
+
+    def run(self):
+        try:
+            from openai import OpenAI
+            import io, contextlib
+        except Exception as e:
+            self.error.emit(f"未安装openai库: {e}")
+            return
+        try:
+            self.progress.emit("读取表格...")
+            table_texts = []
+            for p in self.tables:
+                df = pd.read_excel(p)
+                table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
+            prompt = (
+                "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
+                "\n\n用户需求：\n" + self.instruction +
+                "\n\n请仅返回纯粹的Python代码，不要包含任何解释。"
+            )
+            self.progress.emit("调用模型...")
+            client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                temperature=self.temperature,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant"},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=False
+            )
+            code = response.choices[0].message.content.strip()
+            if code.startswith("```"):
+                code = "\n".join(code.splitlines()[1:-1])
+            self.progress.emit("执行代码...")
+            local_vars = {}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                exec(code, {"pd": pd, "Path": Path}, local_vars)
+            self.success.emit(buf.getvalue())
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class AIHelperDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -373,54 +427,29 @@ class AIHelperDialog(QDialog):
         }
         temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
 
-        table_texts = []
-        for p in self.tables:
-            try:
-                df = pd.read_excel(p)
-                table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"读取表格失败: {p}\n{e}")
-                return
+        self.btn_run.setEnabled(False)
+        progress = QProgressDialog("准备中...", None, 0, 0, self)
+        progress.setWindowTitle("执行中")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.show()
 
-        prompt = (
-            "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
-            "\n\n用户需求：\n" + instruction +
-            "\n\n请仅返回纯粹的Python代码，不要包含任何解释。"
-        )
+        self.worker = AIWorker(api_key, self.tables, instruction, temperature)
+        self.worker.progress.connect(progress.setLabelText)
 
-        try:
-            from openai import OpenAI
-            import io, contextlib
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"未安装openai库: {e}")
-            return
+        def on_success(text):
+            progress.close()
+            QMessageBox.information(self, "执行完成", f"输出：\n{text}")
 
-        try:
-            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                temperature=temperature,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant"},
-                    {"role": "user", "content": prompt}
-                ],
-                stream=False
-            )
-            code = response.choices[0].message.content.strip()
-            if code.startswith("```"):
-                code = "\n".join(code.splitlines()[1:-1])
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"调用API失败：{e}")
-            return
+        def on_error(err):
+            progress.close()
+            QMessageBox.critical(self, "错误", err)
 
-        try:
-            local_vars = {}
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                exec(code, {"pd": pd, "Path": Path}, local_vars)
-            QMessageBox.information(self, "执行完成", f"输出：\n{buf.getvalue()}")
-        except Exception as e:
-            QMessageBox.critical(self, "执行失败", str(e))
+        self.worker.success.connect(on_success)
+        self.worker.error.connect(on_error)
+        self.worker.finished.connect(progress.close)
+        self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
+        self.worker.start()
 
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
