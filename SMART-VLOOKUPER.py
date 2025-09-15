@@ -397,6 +397,7 @@ class AIWorker(QThread):
                     # Each streamed token arrives as a ChoiceDelta object; get its text safely
                     delta_obj = chunk.choices[0].delta
                     delta = getattr(delta_obj, "content", None)
+
                     if delta:
                         code += delta
                         self.code_stream.emit(code)
@@ -563,18 +564,22 @@ class AIHelperDialog(QDialog):
         btn_cancel.clicked.connect(cancel_all)
         code_dlg.rejected.connect(cancel_all)
 
+        btn_exec.clicked.connect(lambda: (self.worker.approve_execution(), code_dlg.accept()))
+
         def update_code(text: str):
             code_view.setPlainText(text)
             sb = code_view.verticalScrollBar()
             sb.setValue(sb.maximum())
 
         self.worker.code_stream.connect(update_code)
+
         def on_code_ready(c: str):
             update_code(c)
             btn_exec.setEnabled(True)
             progress.hide()
 
         self.worker.code_ready.connect(on_code_ready)
+
 
         code_dlg.show()
         progress.show()
