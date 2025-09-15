@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-通用字段映射与匹配工具（PyQt6） - v2.5
-- 修复：修正了Pandas验证回写的逻辑，采用更安全的 'replace' 模式，防止文件损坏
-- 新增：引入模糊匹配逻辑，增强“自动预填”的智能化程度
-- 优化：COM批量写入，大幅提升性能（按列批量写入，而非逐格）
-- 修复：加强异常处理和资源释放，确保文件句柄安全关闭
-- 改进：更清晰的视觉反馈，自动匹配行会高亮显示
+SMART-VLOOKUPER - Excel 字段匹配与 AI 自动化工具 (PyQt6)
 
-依赖: pip install pyqt6 pandas openpyxl pywin32 thefuzz
+主要功能：
+- 模糊字段匹配与 COM 批量写入，自动保留原有单元格格式
+- 内置 AI 助手：上传表格并描述需求后，实时预览流式生成的 Python 代码并在沙箱中执行
+- 失败重试与可取消的进度提示，确保最终产出可正常打开的 Excel 文件
+
+依赖：pip install pyqt6 pandas openpyxl pywin32 thefuzz
 """
 
-import sys, os, re, warnings, json
+import sys, os, re, warnings, json, subprocess, tempfile, threading
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
@@ -20,12 +20,13 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup, QTabWidget
+    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit, QProgressDialog
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 import gc
 from thefuzz import fuzz
+from copy import copy
 
 # —— 静默 openpyxl 的数据验证扩展警告 ——
 warnings.filterwarnings(
@@ -301,6 +302,312 @@ def excel_com_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path:
     
     return total_found, total_write
 
+# ===================== AI 助手 =====================
+
+def summarize_error(msg: str, columns=None) -> str:
+    """提取错误信息的关键信息，减少token占用"""
+    if not msg:
+        return "未知错误"
+    line = msg.strip().splitlines()[-1]
+    m = re.search(r"KeyError: '([^']+)'", line)
+    if m:
+        info = f"执行因 KeyError 失败，缺少列 '{m.group(1)}'"
+        if columns:
+            info += f"。可用列: {list(columns)}"
+        return info
+    return line
+
+
+class AIWorker(QThread):
+    progress = pyqtSignal(str)
+    success = pyqtSignal(str)
+    error = pyqtSignal(str)
+    code_stream = pyqtSignal(str)
+    code_ready = pyqtSignal(str)
+
+    def __init__(self, api_key, tables, instruction, temperature):
+        super().__init__()
+        self.api_key = api_key
+        self.tables = tables
+        self.instruction = instruction
+        self.temperature = temperature
+        self.approval_event = threading.Event()
+
+    def approve_execution(self):
+        self.approval_event.set()
+
+    def run(self):
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            self.error.emit(f"未安装openai库: {e}")
+            return
+
+        self.progress.emit("读取表格示例...")
+        table_texts = []
+        all_columns = set()
+        for p in self.tables:
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
+            df = pd.read_excel(p).fillna("")
+            sample = df.head(5).to_csv(sep='\t', index=False)
+            cols = ", ".join(map(str, df.columns))
+            all_columns.update(df.columns)
+            table_texts.append(f"## {Path(p).name}\n路径: {p}\n列: {cols}\n示例:\n{sample}")
+
+        base_prompt = (
+            "你将获得若干Excel文件的路径、列名以及前5行数据示例。请编写Python代码读取这些路径下的文件以满足用户需求。"\
+            "代码必须在结束前保存一个Excel文件，并打印单行JSON，例如: "\
+            "print(json.dumps({'status':'success','output_path':'C:/path/output.xlsx'}))。"\
+            "不要输出任何解释或额外文本。"\
+            f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n" + "\n\n".join(table_texts)
+        )
+
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        attempt, last_err, last_code = 0, None, ""
+        while attempt < 3:
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
+
+            self.approval_event.clear()
+            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：{last_err}\n请仅返回修正后的Python代码。"
+            self.progress.emit(f"调用模型...尝试{attempt + 1}/3")
+            try:
+                response = client.chat.completions.create(
+                    model="deepseek-chat",
+                    temperature=self.temperature,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    stream=True
+                )
+            except Exception as e:
+                self.error.emit(str(e))
+                return
+
+            code = ""
+            try:
+                for chunk in response:
+                    if self.isInterruptionRequested():
+                        self.error.emit("已取消")
+                        return
+                    # Each streamed token arrives as a ChoiceDelta object; get its text safely
+                    delta_obj = chunk.choices[0].delta
+                    delta = getattr(delta_obj, "content", None)
+                    if delta:
+                        code += delta
+                        self.code_stream.emit(code)
+            except Exception as e:
+                self.error.emit(str(e))
+                return
+
+            code = code.strip()
+            if code.startswith("```"):
+                code = "\n".join(code.splitlines()[1:-1])
+            last_code = code
+
+            self.code_ready.emit(code)
+            self.progress.emit("等待用户确认...")
+            self.approval_event.wait()
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
+
+            self.progress.emit("执行代码...")
+            with tempfile.TemporaryDirectory() as td:
+                script = Path(td) / "script.py"
+                script.write_text(code, encoding="utf-8")
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(script)],
+                        capture_output=True,
+                        text=True,
+                        cwd=td,
+                        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""}
+                    )
+                except Exception as e:
+                    last_err = str(e)
+                    attempt += 1
+                    continue
+
+            stdout = proc.stdout.strip()
+            stderr = proc.stderr.strip()
+            if proc.returncode != 0:
+                last_err = summarize_error(stderr or stdout, all_columns)
+            else:
+                try:
+                    result_json = json.loads(stdout.splitlines()[-1])
+                    if result_json.get("status") == "success":
+                        out_path = Path(result_json.get("output_path", ""))
+                        if out_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"] and out_path.exists():
+                            try:
+                                load_workbook(out_path).close()
+                                self.success.emit(str(out_path))
+                                return
+                            except Exception as e:
+                                last_err = summarize_error(str(e), all_columns)
+                        else:
+                            last_err = "输出路径无效或文件不存在"
+                    else:
+                        last_err = result_json.get("message", "执行失败")
+                except Exception:
+                    last_err = summarize_error(stdout or stderr, all_columns)
+
+            attempt += 1
+
+        self.error.emit((last_err or "执行失败") + f"\n\n最后的代码:\n{last_code}")
+
+
+class AIHelperDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI助手")
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("API Key:"))
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText("DeepSeek API Key")
+        layout.addWidget(self.api_key_edit)
+
+        layout.addWidget(QLabel("使用场景:"))
+        self.scenario_combo = QComboBox()
+        self.scenario_combo.addItems([
+            "代码生成/数学解题",
+            "数据抽取/分析",
+            "通用对话",
+            "翻译",
+            "创意类写作/诗歌创作"
+        ])
+        layout.addWidget(self.scenario_combo)
+
+        self.btn_add_table = QPushButton("添加表格")
+        self.btn_add_table.clicked.connect(self.add_table)
+        layout.addWidget(self.btn_add_table)
+
+        self.table_list = QListWidget()
+        layout.addWidget(self.table_list)
+
+        layout.addWidget(QLabel("需求说明:"))
+        self.instruction_edit = QPlainTextEdit()
+        self.instruction_edit.setPlaceholderText("请用自然语言描述您的需求")
+        layout.addWidget(self.instruction_edit)
+
+        self.btn_run = QPushButton("执行")
+        self.btn_run.clicked.connect(self.run_ai)
+        layout.addWidget(self.btn_run)
+
+        self.tables = []
+
+    def add_table(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择表格", "", "Excel Files (*.xlsx *.xlsm *.xls)")
+        if paths:
+            self.tables.extend(paths)
+            for p in paths:
+                self.table_list.addItem(p)
+
+    def run_ai(self):
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "提示", "请填写API Key")
+            return
+        if not self.tables:
+            QMessageBox.warning(self, "提示", "请至少添加一个表格")
+            return
+        instruction = self.instruction_edit.toPlainText().strip()
+        if not instruction:
+            QMessageBox.warning(self, "提示", "请填写需求说明")
+            return
+
+        temp_map = {
+            "代码生成/数学解题": 0.0,
+            "数据抽取/分析": 1.0,
+            "通用对话": 1.3,
+            "翻译": 1.3,
+            "创意类写作/诗歌创作": 1.5
+        }
+        temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
+
+        self.btn_run.setEnabled(False)
+        progress = QProgressDialog("准备中...", "取消", 0, 0, self)
+        progress.setWindowTitle("执行中")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+
+        self.worker = AIWorker(api_key, self.tables, instruction, temperature)
+        progress.canceled.connect(lambda: (self.worker.requestInterruption(), self.worker.approve_execution()))
+        progress.canceled.connect(progress.close)
+        self.worker.progress.connect(progress.setLabelText)
+
+        code_dlg = QDialog(self)
+        code_dlg.setWindowTitle("模型代码")
+        lay = QVBoxLayout(code_dlg)
+        lay.addWidget(QLabel("模型正在生成Python代码："))
+        code_view = QPlainTextEdit(); code_view.setReadOnly(True)
+        lay.addWidget(code_view)
+        warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
+        lay.addWidget(warn)
+        btn_box = QHBoxLayout()
+        btn_exec = QPushButton("执行"); btn_exec.setEnabled(False)
+        btn_cancel = QPushButton("取消")
+        btn_box.addWidget(btn_exec); btn_box.addWidget(btn_cancel)
+        lay.addLayout(btn_box)
+
+        def cancel_all():
+            self.worker.requestInterruption()
+            self.worker.approve_execution()
+            progress.cancel()
+            code_dlg.close()
+
+        btn_cancel.clicked.connect(cancel_all)
+        code_dlg.rejected.connect(cancel_all)
+
+        def update_code(text: str):
+            code_view.setPlainText(text)
+            sb = code_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+        self.worker.code_stream.connect(update_code)
+        self.worker.code_ready.connect(
+            lambda c: (update_code(c), btn_exec.setEnabled(True), progress.hide())
+        )
+
+        code_dlg.show()
+        progress.show()
+        def exec_and_show_progress():
+            progress.setLabelText("执行中...")
+            progress.show()
+            self.worker.approve_execution()
+            code_dlg.accept()
+
+        btn_exec.clicked.connect(exec_and_show_progress)
+
+        def on_success(path):
+            progress.close()
+            code_dlg.close()
+            QMessageBox.information(self, "执行完成", f"已生成文件：\n{path}")
+
+        def on_error(err):
+            progress.close()
+            code_dlg.close()
+            dlg = QDialog(self)
+            dlg.setWindowTitle("错误")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel("执行失败，以下是错误信息及最后生成的代码："))
+            txt = QPlainTextEdit(); txt.setPlainText(err); txt.setReadOnly(True)
+            lay.addWidget(txt)
+            btn = QPushButton("关闭"); btn.clicked.connect(dlg.accept)
+            lay.addWidget(btn)
+            dlg.exec()
+
+        self.worker.success.connect(on_success)
+        self.worker.error.connect(on_error)
+        self.worker.finished.connect(progress.close)
+        self.worker.finished.connect(code_dlg.close)
+        self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
+        self.worker.start()
+
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
                                     mapping: list, tgt_field_to_col: dict, tgt_data_start_row: int,
@@ -338,7 +645,22 @@ def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: 
         
         for tgt_col, updates in updates_by_col.items():
             for excel_row, val in updates:
-                ws.cell(row=excel_row, column=tgt_col).value = val
+                cell = ws.cell(row=excel_row, column=tgt_col)
+                fmt = {
+                    'font': copy(cell.font),
+                    'fill': copy(cell.fill),
+                    'border': copy(cell.border),
+                    'alignment': copy(cell.alignment),
+                    'number_format': cell.number_format,
+                    'protection': copy(cell.protection)
+                }
+                cell.value = val
+                cell.font = fmt['font']
+                cell.fill = fmt['fill']
+                cell.border = fmt['border']
+                cell.alignment = fmt['alignment']
+                cell.number_format = fmt['number_format']
+                cell.protection = fmt['protection']
                 total_write += 1
         
         wb.save(out_path)
@@ -364,6 +686,7 @@ class MapperUI(QMainWindow):
         self.mode = "one2one"  # 默认一对一
         self._init_ui()
         self._apply_style()
+        self._init_ai_button()
 
     def _init_ui(self):
         central = QWidget()
@@ -776,6 +1099,30 @@ class MapperUI(QMainWindow):
         else:
             msg = "\n\n".join([f"{p}: 命中{f} 写入{w}" for p, _, f, w in results])
             QMessageBox.information(self, "完成", f"已处理{len(results)}个目标表：\n\n{msg}")
+
+    def _init_ai_button(self):
+        self.btn_ai = QPushButton("AI", self)
+        self.btn_ai.setFixedSize(48, 48)
+        self.btn_ai.setStyleSheet(
+            "QPushButton {background:#f97316; color:white; border:none; border-radius:24px;}"
+            "QPushButton:hover {background:#ea580c;}"
+        )
+        self.btn_ai.clicked.connect(self.show_ai_dialog)
+        self._position_ai_button()
+
+    def _position_ai_button(self):
+        x = self.width() - self.btn_ai.width() - 20
+        y = self.height() - self.btn_ai.height() - 20
+        self.btn_ai.move(x, y)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'btn_ai'):
+            self._position_ai_button()
+
+    def show_ai_dialog(self):
+        dlg = AIHelperDialog(self)
+        dlg.exec()
 
     def _apply_style(self):
         self.setStyleSheet("""
