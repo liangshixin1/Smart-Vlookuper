@@ -322,6 +322,7 @@ class AIWorker(QThread):
     progress = pyqtSignal(str)
     success = pyqtSignal(str)
     error = pyqtSignal(str)
+    code_stream = pyqtSignal(str)
     code_ready = pyqtSignal(str)
 
     def __init__(self, api_key, tables, instruction, temperature):
@@ -381,13 +382,27 @@ class AIWorker(QThread):
                         {"role": "system", "content": "You are a helpful assistant"},
                         {"role": "user", "content": prompt}
                     ],
-                    stream=False
+                    stream=True
                 )
             except Exception as e:
                 self.error.emit(str(e))
                 return
 
-            code = response.choices[0].message.content.strip()
+            code = ""
+            try:
+                for chunk in response:
+                    if self.isInterruptionRequested():
+                        self.error.emit("已取消")
+                        return
+                    delta = chunk.choices[0].delta.get("content", "")
+                    if delta:
+                        code += delta
+                        self.code_stream.emit(code)
+            except Exception as e:
+                self.error.emit(str(e))
+                return
+
+            code = code.strip()
             if code.startswith("```"):
                 code = "\n".join(code.splitlines()[1:-1])
             last_code = code
@@ -522,15 +537,50 @@ class AIHelperDialog(QDialog):
         progress.canceled.connect(lambda: (self.worker.requestInterruption(), self.worker.approve_execution()))
         progress.canceled.connect(progress.close)
         self.worker.progress.connect(progress.setLabelText)
-        self.worker.code_ready.connect(self._review_code)
+
+        code_dlg = QDialog(self)
+        code_dlg.setWindowTitle("模型代码")
+        lay = QVBoxLayout(code_dlg)
+        lay.addWidget(QLabel("模型正在生成Python代码："))
+        code_view = QPlainTextEdit(); code_view.setReadOnly(True)
+        lay.addWidget(code_view)
+        warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
+        lay.addWidget(warn)
+        btn_box = QHBoxLayout()
+        btn_exec = QPushButton("执行"); btn_exec.setEnabled(False)
+        btn_cancel = QPushButton("取消")
+        btn_box.addWidget(btn_exec); btn_box.addWidget(btn_cancel)
+        lay.addLayout(btn_box)
+
+        def cancel_all():
+            self.worker.requestInterruption()
+            self.worker.approve_execution()
+            progress.cancel()
+            code_dlg.close()
+
+        btn_cancel.clicked.connect(cancel_all)
+        code_dlg.rejected.connect(cancel_all)
+        btn_exec.clicked.connect(lambda: (self.worker.approve_execution(), code_dlg.accept()))
+
+        def update_code(text: str):
+            code_view.setPlainText(text)
+            sb = code_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+        self.worker.code_stream.connect(update_code)
+        self.worker.code_ready.connect(lambda c: (update_code(c), btn_exec.setEnabled(True)))
+
+        code_dlg.show()
         progress.show()
 
         def on_success(path):
             progress.close()
+            code_dlg.close()
             QMessageBox.information(self, "执行完成", f"已生成文件：\n{path}")
 
         def on_error(err):
             progress.close()
+            code_dlg.close()
             dlg = QDialog(self)
             dlg.setWindowTitle("错误")
             lay = QVBoxLayout(dlg)
@@ -544,30 +594,9 @@ class AIHelperDialog(QDialog):
         self.worker.success.connect(on_success)
         self.worker.error.connect(on_error)
         self.worker.finished.connect(progress.close)
+        self.worker.finished.connect(code_dlg.close)
         self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
         self.worker.start()
-
-    def _review_code(self, code: str):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("执行确认")
-        lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("以下代码由模型生成，请确认是否执行："))
-        txt = QPlainTextEdit(); txt.setPlainText(code); txt.setReadOnly(True)
-        lay.addWidget(txt)
-        warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
-        lay.addWidget(warn)
-        btn_box = QHBoxLayout()
-        btn_ok = QPushButton("执行")
-        btn_cancel = QPushButton("取消")
-        btn_box.addWidget(btn_ok); btn_box.addWidget(btn_cancel)
-        lay.addLayout(btn_box)
-        btn_ok.clicked.connect(dlg.accept)
-        btn_cancel.clicked.connect(dlg.reject)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.worker.approve_execution()
-        else:
-            self.worker.requestInterruption()
-            self.worker.approve_execution()
 
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
