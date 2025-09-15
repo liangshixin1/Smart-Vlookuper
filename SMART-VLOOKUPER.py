@@ -10,7 +10,7 @@
 依赖: pip install pyqt6 pandas openpyxl pywin32 thefuzz
 """
 
-import sys, os, re, warnings, json
+import sys, os, re, warnings, json, subprocess, tempfile, threading
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
@@ -304,10 +304,25 @@ def excel_com_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path:
 
 # ===================== AI 助手 =====================
 
+def summarize_error(msg: str, columns=None) -> str:
+    """提取错误信息的关键信息，减少token占用"""
+    if not msg:
+        return "未知错误"
+    line = msg.strip().splitlines()[-1]
+    m = re.search(r"KeyError: '([^']+)'", line)
+    if m:
+        info = f"执行因 KeyError 失败，缺少列 '{m.group(1)}'"
+        if columns:
+            info += f"。可用列: {list(columns)}"
+        return info
+    return line
+
+
 class AIWorker(QThread):
     progress = pyqtSignal(str)
     success = pyqtSignal(str)
     error = pyqtSignal(str)
+    code_ready = pyqtSignal(str)
 
     def __init__(self, api_key, tables, instruction, temperature):
         super().__init__()
@@ -315,38 +330,48 @@ class AIWorker(QThread):
         self.tables = tables
         self.instruction = instruction
         self.temperature = temperature
+        self.approval_event = threading.Event()
+
+    def approve_execution(self):
+        self.approval_event.set()
 
     def run(self):
         try:
             from openai import OpenAI
-            import io, contextlib, traceback
         except Exception as e:
             self.error.emit(f"未安装openai库: {e}")
             return
 
-        self.progress.emit("读取表格...")
+        self.progress.emit("读取表格示例...")
         table_texts = []
+        all_columns = set()
         for p in self.tables:
             if self.isInterruptionRequested():
                 self.error.emit("已取消")
                 return
-            df = pd.read_excel(p)
-            table_texts.append(f"## {Path(p).name}\n" + df.to_csv(sep='\t', index=False))
+            df = pd.read_excel(p).fillna("")
+            sample = df.head(5).to_csv(sep='\t', index=False)
+            cols = ", ".join(map(str, df.columns))
+            all_columns.update(df.columns)
+            table_texts.append(f"## {Path(p).name}\n路径: {p}\n列: {cols}\n示例:\n{sample}")
 
         base_prompt = (
-            "以下是用户提供的表格数据：\n\n" + "\n\n".join(table_texts) +
-            "\n\n用户需求：\n" + self.instruction +
-            "\n\n请生成Python代码，该代码必须将处理结果保存为Excel文件（xlsx）并使用print输出其绝对路径，且不要包含任何解释。"
+            "你将获得若干Excel文件的路径、列名以及前5行数据示例。请编写Python代码读取这些路径下的文件以满足用户需求。"\
+            "代码必须在结束前保存一个Excel文件，并打印单行JSON，例如: "\
+            "print(json.dumps({'status':'success','output_path':'C:/path/output.xlsx'}))。"\
+            "不要输出任何解释或额外文本。"\
+            f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n" + "\n\n".join(table_texts)
         )
 
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
-        attempt, last_err = 0, None
+        attempt, last_err, last_code = 0, None, ""
         while attempt < 3:
             if self.isInterruptionRequested():
                 self.error.emit("已取消")
                 return
 
-            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：\n{last_err}\n请修正后仅返回Python代码。"
+            self.approval_event.clear()
+            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：{last_err}\n请仅返回修正后的Python代码。"
             self.progress.emit(f"调用模型...尝试{attempt + 1}/3")
             try:
                 response = client.chat.completions.create(
@@ -365,30 +390,58 @@ class AIWorker(QThread):
             code = response.choices[0].message.content.strip()
             if code.startswith("```"):
                 code = "\n".join(code.splitlines()[1:-1])
+            last_code = code
+
+            self.code_ready.emit(code)
+            self.progress.emit("等待用户确认...")
+            self.approval_event.wait()
+            if self.isInterruptionRequested():
+                self.error.emit("已取消")
+                return
 
             self.progress.emit("执行代码...")
-            local_vars = {}
-            buf = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(buf):
-                    exec(code, {"pd": pd, "Path": Path}, local_vars)
-                output = buf.getvalue().strip()
-                out_path = Path(output)
-                if out_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"] and out_path.exists():
-                    try:
-                        load_workbook(out_path).close()
-                        self.success.emit(str(out_path))
-                        return
-                    except Exception as e:
-                        last_err = f"生成的文件无法打开: {e}"
-                else:
-                    last_err = f"代码未输出Excel文件路径，输出为: {output}"
-            except Exception:
-                last_err = traceback.format_exc()
+            with tempfile.TemporaryDirectory() as td:
+                script = Path(td) / "script.py"
+                script.write_text(code, encoding="utf-8")
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(script)],
+                        capture_output=True,
+                        text=True,
+                        cwd=td,
+                        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""}
+                    )
+                except Exception as e:
+                    last_err = str(e)
+                    attempt += 1
+                    continue
+
+            stdout = proc.stdout.strip()
+            stderr = proc.stderr.strip()
+            if proc.returncode != 0:
+                last_err = summarize_error(stderr or stdout, all_columns)
+            else:
+                try:
+                    result_json = json.loads(stdout.splitlines()[-1])
+                    if result_json.get("status") == "success":
+                        out_path = Path(result_json.get("output_path", ""))
+                        if out_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"] and out_path.exists():
+                            try:
+                                load_workbook(out_path).close()
+                                self.success.emit(str(out_path))
+                                return
+                            except Exception as e:
+                                last_err = summarize_error(str(e), all_columns)
+                        else:
+                            last_err = "输出路径无效或文件不存在"
+                    else:
+                        last_err = result_json.get("message", "执行失败")
+                except Exception:
+                    last_err = summarize_error(stdout or stderr, all_columns)
 
             attempt += 1
 
-        self.error.emit(last_err or "执行失败")
+        self.error.emit((last_err or "执行失败") + f"\n\n最后的代码:\n{last_code}")
 
 
 class AIHelperDialog(QDialog):
@@ -466,9 +519,10 @@ class AIHelperDialog(QDialog):
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
 
         self.worker = AIWorker(api_key, self.tables, instruction, temperature)
-        progress.canceled.connect(lambda: self.worker.requestInterruption())
+        progress.canceled.connect(lambda: (self.worker.requestInterruption(), self.worker.approve_execution()))
         progress.canceled.connect(progress.close)
         self.worker.progress.connect(progress.setLabelText)
+        self.worker.code_ready.connect(self._review_code)
         progress.show()
 
         def on_success(path):
@@ -477,13 +531,43 @@ class AIHelperDialog(QDialog):
 
         def on_error(err):
             progress.close()
-            QMessageBox.critical(self, "错误", err)
+            dlg = QDialog(self)
+            dlg.setWindowTitle("错误")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel("执行失败，以下是错误信息及最后生成的代码："))
+            txt = QPlainTextEdit(); txt.setPlainText(err); txt.setReadOnly(True)
+            lay.addWidget(txt)
+            btn = QPushButton("关闭"); btn.clicked.connect(dlg.accept)
+            lay.addWidget(btn)
+            dlg.exec()
 
         self.worker.success.connect(on_success)
         self.worker.error.connect(on_error)
         self.worker.finished.connect(progress.close)
         self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
         self.worker.start()
+
+    def _review_code(self, code: str):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("执行确认")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("以下代码由模型生成，请确认是否执行："))
+        txt = QPlainTextEdit(); txt.setPlainText(code); txt.setReadOnly(True)
+        lay.addWidget(txt)
+        warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
+        lay.addWidget(warn)
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("执行")
+        btn_cancel = QPushButton("取消")
+        btn_box.addWidget(btn_ok); btn_box.addWidget(btn_cancel)
+        lay.addLayout(btn_box)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.worker.approve_execution()
+        else:
+            self.worker.requestInterruption()
+            self.worker.approve_execution()
 
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
