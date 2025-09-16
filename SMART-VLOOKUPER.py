@@ -20,10 +20,11 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit, QProgressDialog
+    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit, QProgressDialog,
+    QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import QBrush, QColor, QAction
 import gc
 from thefuzz import fuzz
 from copy import copy
@@ -35,6 +36,92 @@ warnings.filterwarnings(
     category=UserWarning,
     module="openpyxl"
 )
+
+# ===================== 全局设置管理 =====================
+
+class AppSettings:
+    """简单的JSON配置管理器，用于持久化用户偏好"""
+
+    DEFAULTS = {
+        "ai_api_key": "",
+        "theme": "dark",
+        "engine_mode": "auto",
+        "last_ai_export_path": ""
+    }
+
+    def __init__(self):
+        self.config_dir = Path.home() / ".smart_vlookuper"
+        self.path = self.config_dir / "settings.json"
+        self.data = self.DEFAULTS.copy()
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.data.update({k: loaded.get(k, v) for k, v in self.DEFAULTS.items()})
+            except Exception:
+                # 读取失败时保留默认配置
+                pass
+
+    def save(self):
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            # 配置写入失败不阻塞主流程
+            pass
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+    def update(self, **kwargs):
+        self.data.update(kwargs)
+        self.save()
+
+
+DARK_STYLESHEET = """
+    QMainWindow { background: #0f172a; color: #e5e7eb; }
+    QLabel { color: #cbd5e1; font-weight: 600; }
+    QGroupBox { border: 1px solid #1f2937; border-radius: 10px; margin-top: 10px; padding: 10px; color: #e5e7eb; font-weight: 600; }
+    QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 6px; }
+    QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 8px; padding: 6px; }
+    QComboBox::drop-down { border: none; }
+    QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
+    QPushButton:hover { background: #1d4ed8; }
+    QPushButton:disabled { background: #334155; color: #9ca3af; }
+    QRadioButton { color: #e5e7eb; font-weight: normal; }
+    QHeaderView::section { background: #0b1220; color: #cbd5e1; padding: 6px; border: none; }
+    QTableWidget { gridline-color: #374151; }
+    QTableWidget::item { padding-left: 5px; }
+    QTabWidget::pane { border: 1px solid #1f2937; border-radius: 10px; }
+    QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+    QTabBar::tab:selected { background: #2563eb; color: white; }
+"""
+
+
+LIGHT_STYLESHEET = """
+    QMainWindow { background: #f8fafc; color: #0f172a; }
+    QLabel { color: #0f172a; font-weight: 600; }
+    QGroupBox { border: 1px solid #cbd5e1; border-radius: 10px; margin-top: 10px; padding: 10px; color: #0f172a; font-weight: 600; background: #ffffff; }
+    QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 6px; }
+    QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #ffffff; color: #111827; border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; }
+    QComboBox::drop-down { border: none; }
+    QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
+    QPushButton:hover { background: #1d4ed8; }
+    QPushButton:disabled { background: #cbd5e1; color: #94a3b8; }
+    QRadioButton { color: #0f172a; font-weight: normal; }
+    QHeaderView::section { background: #e2e8f0; color: #1e293b; padding: 6px; border: none; }
+    QTableWidget { gridline-color: #cbd5e1; }
+    QTableWidget::item { padding-left: 5px; }
+    QTabWidget::pane { border: 1px solid #cbd5e1; border-radius: 10px; background: #ffffff; }
+    QTabBar::tab { background: #e2e8f0; color: #1e293b; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+    QTabBar::tab:selected { background: #2563eb; color: white; }
+"""
 
 # ===================== 基础工具与模糊匹配 =====================
 
@@ -325,12 +412,14 @@ class AIWorker(QThread):
     code_stream = pyqtSignal(str)
     code_ready = pyqtSignal(str)
 
-    def __init__(self, api_key, tables, instruction, temperature):
+    def __init__(self, api_key, tables, instruction, temperature, language, output_path):
         super().__init__()
         self.api_key = api_key
-        self.tables = tables
+        self.tables = [str(p) for p in tables]
         self.instruction = instruction
         self.temperature = temperature
+        self.language = language
+        self.output_path = Path(output_path)
         self.approval_event = threading.Event()
 
     def approve_execution(self):
@@ -356,13 +445,41 @@ class AIWorker(QThread):
             all_columns.update(df.columns)
             table_texts.append(f"## {Path(p).name}\n路径: {p}\n列: {cols}\n示例:\n{sample}")
 
-        base_prompt = (
-            "你将获得若干Excel文件的路径、列名以及前5行数据示例。请编写Python代码读取这些路径下的文件以满足用户需求。"\
-            "代码必须在结束前保存一个Excel文件，并打印单行JSON，例如: "\
-            "print(json.dumps({'status':'success','output_path':'C:/path/output.xlsx'}))。"\
-            "不要输出任何解释或额外文本。"\
-            f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n" + "\n\n".join(table_texts)
-        )
+        try:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.error.emit(f"无法创建导出目录：{e}")
+            return
+
+        output_path_str = str(self.output_path)
+        tables_json = json.dumps(self.tables, ensure_ascii=False) if self.tables else "[]"
+        table_list_string = "\n".join(self.tables)
+        table_info_text = "\n\n".join(table_texts)
+        language_key = self.language.lower()
+
+        if language_key == "vba":
+            base_prompt = (
+                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成VBA代码。"
+                "必须声明一个入口宏：Sub ProcessTables(tableList As String, outputPath As String)。"
+                "参数 tableList 为使用换行分隔的完整Excel路径字符串；outputPath 为结果Excel文件的完整保存路径。"
+                f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。"
+                "请在宏内拆分 tableList，按需打开并处理这些工作簿，最终将结果保存到 outputPath 指定的路径。"
+                "不要弹出对话框或依赖任何交互，也不要修改除结果文件外的其他文件。"
+                "仅返回纯VBA代码，不要包含```标记或额外说明。"
+                f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n{table_info_text}"
+            )
+            retry_suffix = "请仅返回修正后的VBA代码。"
+        else:
+            base_prompt = (
+                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成可直接运行的Python代码以满足用户需求。"
+                "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。"
+                f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。"
+                "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。"
+                "不要输出任何解释或额外文本。"
+                f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n{table_info_text}"
+            )
+            retry_suffix = "请仅返回修正后的Python代码。"
+
 
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
         attempt, last_err, last_code = 0, None, ""
@@ -372,8 +489,8 @@ class AIWorker(QThread):
                 return
 
             self.approval_event.clear()
-            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：{last_err}\n请仅返回修正后的Python代码。"
-            self.progress.emit(f"调用模型...尝试{attempt + 1}/3")
+            prompt = base_prompt if not last_err else base_prompt + f"\n\n上次执行错误：{last_err}\n{retry_suffix}"
+            self.progress.emit(f"调用模型生成{self.language}代码...尝试{attempt + 1}/3")
             try:
                 response = client.chat.completions.create(
                     model="deepseek-chat",
@@ -417,61 +534,141 @@ class AIWorker(QThread):
                 self.error.emit("已取消")
                 return
 
-            self.progress.emit("执行代码...")
-            with tempfile.TemporaryDirectory() as td:
-                script = Path(td) / "script.py"
-                script.write_text(code, encoding="utf-8")
+            if self.output_path.exists():
                 try:
-                    proc = subprocess.run(
-                        [sys.executable, str(script)],
-                        capture_output=True,
-                        text=True,
-                        cwd=td,
-                        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ""}
-                    )
+                    self.output_path.unlink()
                 except Exception as e:
-                    last_err = str(e)
+                    last_err = f"无法覆盖现有输出文件：{e}"
                     attempt += 1
                     continue
 
-            stdout = proc.stdout.strip()
-            stderr = proc.stderr.strip()
-            if proc.returncode != 0:
-                last_err = summarize_error(stderr or stdout, all_columns)
-            else:
+            self.progress.emit("执行代码...")
+            if language_key == "vba":
                 try:
-                    result_json = json.loads(stdout.splitlines()[-1])
-                    if result_json.get("status") == "success":
-                        out_path = Path(result_json.get("output_path", ""))
-                        if out_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"] and out_path.exists():
-                            try:
-                                load_workbook(out_path).close()
-                                self.success.emit(str(out_path))
-                                return
-                            except Exception as e:
-                                last_err = summarize_error(str(e), all_columns)
-                        else:
-                            last_err = "输出路径无效或文件不存在"
+                    execute_vba_module(code, table_list_string, self.output_path)
+                except Exception as e:
+                    last_err = summarize_error(str(e), all_columns)
+                    attempt += 1
+                    continue
+
+                expected_path = self.output_path
+                if expected_path.exists():
+                    try:
+                        load_workbook(expected_path).close()
+                        self.success.emit(str(expected_path))
+                        return
+                    except Exception as e:
+                        last_err = summarize_error(str(e), all_columns)
+                else:
+                    last_err = f"未生成指定路径的文件：{expected_path}"
+            else:
+                with tempfile.TemporaryDirectory() as td:
+                    script = Path(td) / "script.py"
+                    script.write_text(code, encoding="utf-8")
+                    env = os.environ.copy()
+                    env.setdefault("PYTHONPATH", "")
+                    env["AI_TABLE_PATHS"] = tables_json
+                    env["AI_TABLE_LIST"] = table_list_string
+                    env["AI_OUTPUT_PATH"] = output_path_str
+                    env["AI_INSTRUCTION_TEXT"] = self.instruction
+                    try:
+                        proc = subprocess.run(
+                            [sys.executable, str(script)],
+                            capture_output=True,
+                            text=True,
+                            cwd=td,
+                            env=env,
+                        )
+                    except Exception as e:
+                        last_err = str(e)
+                        attempt += 1
+                        continue
+
+                stdout = proc.stdout.strip()
+                stderr = proc.stderr.strip()
+                if proc.returncode != 0:
+                    last_err = summarize_error(stderr or stdout, all_columns)
+                else:
+                    expected_path = self.output_path
+                    if expected_path.exists():
+                        try:
+                            load_workbook(expected_path).close()
+                            self.success.emit(str(expected_path))
+                            return
+                        except Exception as e:
+                            last_err = summarize_error(str(e), all_columns)
                     else:
-                        last_err = result_json.get("message", "执行失败")
-                except Exception:
-                    last_err = summarize_error(stdout or stderr, all_columns)
+                        result_json = None
+                        if stdout:
+                            try:
+                                result_json = json.loads(stdout.splitlines()[-1])
+                            except Exception:
+                                result_json = None
+                        if result_json and result_json.get("output_path"):
+                            candidate = Path(result_json.get("output_path"))
+                            if candidate.exists():
+                                last_err = f"模型在 {candidate} 生成了文件，请将结果保存至指定路径：{expected_path}"
+                            else:
+                                last_err = f"未能在指定路径生成结果文件：{expected_path}"
+                        else:
+                            last_err = summarize_error(stdout or stderr, all_columns)
+
 
             attempt += 1
 
         self.error.emit((last_err or "执行失败") + f"\n\n最后的代码:\n{last_code}")
 
 
+def execute_vba_module(code: str, table_payload: str, output_path: Path):
+    """在临时工作簿中插入并执行VBA代码"""
+    try:
+        import win32com.client as win32
+    except Exception as e:
+        raise RuntimeError("未安装或无法加载 pywin32。") from e
+
+    excel = None
+    wb = None
+    try:
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        try:
+            wb = excel.Workbooks.Add()
+        except Exception as e:
+            raise RuntimeError(f"无法创建临时工作簿：{e}") from e
+
+        try:
+            module = wb.VBProject.VBComponents.Add(1)
+        except Exception as e:
+            raise RuntimeError("无法访问Excel VBA项目，请在Excel选项中启用“信任对VBA项目对象模型的访问”。") from e
+
+        module.CodeModule.AddFromString(code)
+        try:
+            excel.Run("ProcessTables", table_payload, str(output_path))
+        except Exception as e:
+            raise RuntimeError(f"VBA 执行失败：{e}") from e
+
+    finally:
+        if wb:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        gc.collect()
+
+
 class AIHelperDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent, settings: AppSettings):
         super().__init__(parent)
         self.setWindowTitle("AI助手")
+        self.settings = settings
+        self.tables = []
         layout = QVBoxLayout(self)
-
-        layout.addWidget(QLabel("API Key:"))
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setPlaceholderText("DeepSeek API Key")
-        layout.addWidget(self.api_key_edit)
 
         layout.addWidget(QLabel("使用场景:"))
         self.scenario_combo = QComboBox()
@@ -496,11 +693,29 @@ class AIHelperDialog(QDialog):
         self.instruction_edit.setPlaceholderText("请用自然语言描述您的需求")
         layout.addWidget(self.instruction_edit)
 
+        layout.addWidget(QLabel("生成代码语言:"))
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(["Python", "VBA"])
+        layout.addWidget(self.language_combo)
+
+        layout.addWidget(QLabel("导出结果路径:"))
+        path_layout = QHBoxLayout()
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("请选择AI生成结果的保存路径")
+        default_output = self.settings.get("last_ai_export_path", "") or ""
+        if default_output:
+            self.output_edit.setText(default_output)
+        btn_browse = QPushButton("浏览…")
+        btn_browse.clicked.connect(self.browse_output)
+        path_layout.addWidget(self.output_edit, 1)
+        path_layout.addWidget(btn_browse)
+        layout.addLayout(path_layout)
+
         self.btn_run = QPushButton("执行")
         self.btn_run.clicked.connect(self.run_ai)
         layout.addWidget(self.btn_run)
 
-        self.tables = []
+        self.worker = None
 
     def add_table(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择表格", "", "Excel Files (*.xlsx *.xlsm *.xls)")
@@ -509,10 +724,33 @@ class AIHelperDialog(QDialog):
             for p in paths:
                 self.table_list.addItem(p)
 
+    def browse_output(self):
+        current = self.output_edit.text().strip()
+        initial_dir = current
+        if current:
+            cp = Path(current)
+            initial_dir = str(cp.parent if cp.suffix else cp)
+        else:
+            stored = self.settings.get("last_ai_export_path", "") or ""
+            if stored:
+                try:
+                    initial_dir = str(Path(stored).parent)
+                except Exception:
+                    initial_dir = str(Path.home())
+            else:
+                initial_dir = str(Path.home())
+        path, _ = QFileDialog.getSaveFileName(self, "选择导出文件", initial_dir, "Excel Files (*.xlsx *.xlsm *.xls)")
+        if path:
+            p = Path(path)
+            if not p.suffix:
+                p = p.with_suffix(".xlsx")
+            self.output_edit.setText(str(p))
+            self.settings.update(last_ai_export_path=str(p))
+
     def run_ai(self):
-        api_key = self.api_key_edit.text().strip()
+        api_key = (self.settings.get("ai_api_key", "") or "").strip()
         if not api_key:
-            QMessageBox.warning(self, "提示", "请填写API Key")
+            QMessageBox.warning(self, "提示", "请先在“设置”中填写API Key。")
             return
         if not self.tables:
             QMessageBox.warning(self, "提示", "请至少添加一个表格")
@@ -522,6 +760,25 @@ class AIHelperDialog(QDialog):
             QMessageBox.warning(self, "提示", "请填写需求说明")
             return
 
+        output_path_text = self.output_edit.text().strip()
+        if not output_path_text:
+            QMessageBox.warning(self, "提示", "请先选择导出结果路径")
+            return
+        output_path = Path(output_path_text)
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".xlsx")
+            self.output_edit.setText(str(output_path))
+        if output_path.suffix.lower() not in [".xlsx", ".xlsm", ".xls"]:
+            QMessageBox.warning(self, "提示", "导出文件仅支持 .xlsx/.xlsm/.xls 格式")
+            return
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"无法创建导出目录：{e}")
+            return
+
+        self.settings.update(last_ai_export_path=str(output_path))
+
         temp_map = {
             "代码生成/数学解题": 0.0,
             "数据抽取/分析": 1.0,
@@ -530,41 +787,43 @@ class AIHelperDialog(QDialog):
             "创意类写作/诗歌创作": 1.5
         }
         temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
+        language = self.language_combo.currentText()
 
         self.btn_run.setEnabled(False)
         progress = QProgressDialog("准备中...", "取消", 0, 0, self)
         progress.setWindowTitle("执行中")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
 
-        self.worker = AIWorker(api_key, self.tables, instruction, temperature)
-        progress.canceled.connect(lambda: (self.worker.requestInterruption(), self.worker.approve_execution()))
-        progress.canceled.connect(progress.close)
-        self.worker.progress.connect(progress.setLabelText)
+        self.worker = AIWorker(api_key, self.tables, instruction, temperature, language, str(output_path))
 
         code_dlg = QDialog(self)
         code_dlg.setWindowTitle("模型代码")
         lay = QVBoxLayout(code_dlg)
-        lay.addWidget(QLabel("模型正在生成Python代码："))
-        code_view = QPlainTextEdit(); code_view.setReadOnly(True)
+        lay.addWidget(QLabel(f"模型正在生成{language}代码："))
+        code_view = QPlainTextEdit()
+        code_view.setReadOnly(True)
         lay.addWidget(code_view)
         warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
         lay.addWidget(warn)
         btn_box = QHBoxLayout()
-        btn_exec = QPushButton("执行"); btn_exec.setEnabled(False)
+        btn_exec = QPushButton("执行")
+        btn_exec.setEnabled(False)
         btn_cancel = QPushButton("取消")
-        btn_box.addWidget(btn_exec); btn_box.addWidget(btn_cancel)
+        btn_box.addWidget(btn_exec)
+        btn_box.addWidget(btn_cancel)
         lay.addLayout(btn_box)
 
         def cancel_all():
-            self.worker.requestInterruption()
-            self.worker.approve_execution()
+            if self.worker:
+                self.worker.requestInterruption()
+                self.worker.approve_execution()
             progress.cancel()
             code_dlg.close()
 
         btn_cancel.clicked.connect(cancel_all)
         code_dlg.rejected.connect(cancel_all)
-
-        btn_exec.clicked.connect(lambda: (self.worker.approve_execution(), code_dlg.accept()))
+        progress.canceled.connect(cancel_all)
+        self.worker.progress.connect(progress.setLabelText)
 
         def update_code(text: str):
             code_view.setPlainText(text)
@@ -580,22 +839,22 @@ class AIHelperDialog(QDialog):
 
         self.worker.code_ready.connect(on_code_ready)
 
-
         code_dlg.show()
         progress.show()
 
         def exec_and_show_progress():
             progress.setLabelText("执行中...")
             progress.show()
-            self.worker.approve_execution()
+            if self.worker:
+                self.worker.approve_execution()
             code_dlg.accept()
 
         btn_exec.clicked.connect(exec_and_show_progress)
 
-        def on_success(path):
+        def on_success(path_str):
             progress.close()
             code_dlg.close()
-            QMessageBox.information(self, "执行完成", f"已生成文件：\n{path}")
+            QMessageBox.information(self, "执行完成", f"已生成文件：\n{path_str}")
 
         def on_error(err):
             progress.close()
@@ -604,9 +863,12 @@ class AIHelperDialog(QDialog):
             dlg.setWindowTitle("错误")
             lay = QVBoxLayout(dlg)
             lay.addWidget(QLabel("执行失败，以下是错误信息及最后生成的代码："))
-            txt = QPlainTextEdit(); txt.setPlainText(err); txt.setReadOnly(True)
+            txt = QPlainTextEdit()
+            txt.setPlainText(err)
+            txt.setReadOnly(True)
             lay.addWidget(txt)
-            btn = QPushButton("关闭"); btn.clicked.connect(dlg.accept)
+            btn = QPushButton("关闭")
+            btn.clicked.connect(dlg.accept)
             lay.addWidget(btn)
             dlg.exec()
 
@@ -616,6 +878,50 @@ class AIHelperDialog(QDialog):
         self.worker.finished.connect(code_dlg.close)
         self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
         self.worker.start()
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent, settings: AppSettings):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("设置")
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("DeepSeek API Key:"))
+        self.api_edit = QLineEdit(self.settings.get("ai_api_key", ""))
+        self.api_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.api_edit)
+
+        layout.addWidget(QLabel("主题模式:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["深色", "浅色"])
+        current_theme = self.settings.get("theme", "dark")
+        self.theme_combo.setCurrentIndex(0 if current_theme == "dark" else 1)
+        layout.addWidget(self.theme_combo)
+
+        layout.addWidget(QLabel("Excel 写入引擎:"))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(["自动选择", "仅使用COM", "仅使用openpyxl"])
+        engine_mode = self.settings.get("engine_mode", "auto")
+        engine_index = {"auto": 0, "com": 1, "openpyxl": 2}.get(engine_mode, 0)
+        self.engine_combo.setCurrentIndex(engine_index)
+        layout.addWidget(self.engine_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        theme = "dark" if self.theme_combo.currentIndex() == 0 else "light"
+        engine_mode = {0: "auto", 1: "com", 2: "openpyxl"}[self.engine_combo.currentIndex()]
+        self.settings.update(
+            ai_api_key=self.api_edit.text().strip(),
+            theme=theme,
+            engine_mode=engine_mode
+        )
+        super().accept()
+
 
 def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: Path,
                                     df_src: pd.DataFrame, df_tgt: pd.DataFrame, src_map: pd.DataFrame,
@@ -687,15 +993,17 @@ def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: 
 class MapperUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("智能Vlookuper 1.0.1 -梁诗忻开发")
+        self.settings = AppSettings()
+        self.setWindowTitle("智能Vlookuper 1.1 -梁诗忻开发")
         self.resize(1200, 820)
         # 多表模式下，源表和目标表都可能有多个，通过列表维护
         self.src_groups, self.tgt_groups = [], []
         self.src_headers, self.tgt_headers = [], []
         self.mode = "one2one"  # 默认一对一
         self._init_ui()
-        self._apply_style()
+        self._create_menus()
         self._init_ai_button()
+        self._apply_style()
 
     def _init_ui(self):
         central = QWidget()
@@ -766,6 +1074,33 @@ class MapperUI(QMainWindow):
         self.btn_run.clicked.connect(self.run_and_export)
         self.on_mode_change()
         self.setCentralWidget(central)
+
+    def _create_menus(self):
+        bar = self.menuBar()
+        settings_menu = bar.addMenu("设置")
+        action_prefs = QAction("首选项...", self)
+        action_prefs.triggered.connect(self.open_settings_dialog)
+        settings_menu.addAction(action_prefs)
+
+        about_menu = bar.addMenu("关于")
+        action_about = QAction("关于 SMART VLOOKUPER", self)
+        action_about.triggered.connect(self.show_about_dialog)
+        about_menu.addAction(action_about)
+
+    def _update_ai_button_style(self):
+        if not hasattr(self, "btn_ai"):
+            return
+        if self.settings.get("theme", "dark") == "dark":
+            style = (
+                "QPushButton {background:#f97316; color:white; border:none; border-radius:24px;}"
+                "QPushButton:hover {background:#ea580c;}"
+            )
+        else:
+            style = (
+                "QPushButton {background:#fb923c; color:#1f2937; border:none; border-radius:24px;}"
+                "QPushButton:hover {background:#f97316;}"
+            )
+        self.btn_ai.setStyleSheet(style)
 
     # ---- 动态增减源/目标组 ----
     def add_source_group(self):
@@ -1051,6 +1386,7 @@ class MapperUI(QMainWindow):
         df_src["_IDX_"] = df_src[src_idx].apply(norm_str)
         src_map = df_src.drop_duplicates(subset=["_IDX_"], keep='last').set_index("_IDX_")
 
+        engine_mode = self.settings.get("engine_mode", "auto")
         results = []
         for tgt_g in self.tgt_groups:
             try:
@@ -1064,12 +1400,20 @@ class MapperUI(QMainWindow):
             overwrite_all = self.rb_overwrite.isChecked()
             out_path = Path(tgt_g._path).with_name(f"{Path(tgt_g._path).stem}_匹配输出{Path(tgt_g._path).suffix}")
 
-            try:
-                total_found, total_write = excel_com_write_and_save_optimized(
-                    tgt_g._path, tgt_g._sheet, out_path, df_src, df_tgt, src_map,
-                    mapping, tgt_field_to_col, tgt_g._header_row + 1, overwrite_all)
-                engine = "Excel COM（批量优化）"
-            except Exception as e1:
+            engine = ""
+            errors = {}
+            if engine_mode in ("auto", "com"):
+                try:
+                    total_found, total_write = excel_com_write_and_save_optimized(
+                        tgt_g._path, tgt_g._sheet, out_path, df_src, df_tgt, src_map,
+                        mapping, tgt_field_to_col, tgt_g._header_row + 1, overwrite_all)
+                    engine = "Excel COM（批量优化）"
+                except Exception as e1:
+                    errors["com"] = e1
+                    if engine_mode == "com":
+                        QMessageBox.critical(self, "错误", f"COM 保存失败：\n{e1}")
+                        return
+            if not engine and engine_mode in ("auto", "openpyxl"):
                 try:
                     total_found, total_write = openpyxl_write_and_save_optimized(
                         tgt_g._path, tgt_g._sheet, out_path, df_src, df_tgt, src_map,
@@ -1090,9 +1434,28 @@ class MapperUI(QMainWindow):
                     except Exception:
                         # 验证失败，但原文件可能仍然可用
                         pass
-
                 except Exception as e2:
-                    QMessageBox.critical(self, "错误", f"所有保存方式均失败：\n\nCOM错误：{str(e1)[:200]}...\n\nopenpyxl错误：{str(e2)[:200]}...\n\n建议：\n1. 确保目标Excel文件未被其他程序占用\n2. 检查文件权限\n3. 尝试关闭Excel程序后重试"); return
+                    errors["openpyxl"] = e2
+                    if engine_mode == "openpyxl":
+                        QMessageBox.critical(self, "错误", f"openpyxl 保存失败：\n{e2}")
+                        return
+            if not engine:
+                def _short(err, default):
+                    if err is None:
+                        return default
+                    msg = str(err)
+                    return msg if len(msg) <= 200 else msg[:200] + "..."
+
+                com_default = "未尝试（根据设置跳过）" if engine_mode == "openpyxl" else "无可用错误信息"
+                op_default = "未尝试（根据设置跳过）" if engine_mode == "com" else "无可用错误信息"
+                com_msg = _short(errors.get("com"), com_default)
+                op_msg = _short(errors.get("openpyxl"), op_default)
+                QMessageBox.critical(
+                    self,
+                    "错误",
+                    f"所有保存方式均失败：\n\nCOM错误：{com_msg}\n\nopenpyxl错误：{op_msg}\n\n建议：\n1. 确保目标Excel文件未被其他程序占用\n2. 检查文件权限\n3. 尝试关闭Excel程序后重试"
+                )
+                return
 
             results.append((out_path, engine, total_found, total_write))
 
@@ -1112,10 +1475,7 @@ class MapperUI(QMainWindow):
     def _init_ai_button(self):
         self.btn_ai = QPushButton("AI", self)
         self.btn_ai.setFixedSize(48, 48)
-        self.btn_ai.setStyleSheet(
-            "QPushButton {background:#f97316; color:white; border:none; border-radius:24px;}"
-            "QPushButton:hover {background:#ea580c;}"
-        )
+        self._update_ai_button_style()
         self.btn_ai.clicked.connect(self.show_ai_dialog)
         self._position_ai_button()
 
@@ -1130,28 +1490,28 @@ class MapperUI(QMainWindow):
             self._position_ai_button()
 
     def show_ai_dialog(self):
-        dlg = AIHelperDialog(self)
+        dlg = AIHelperDialog(self, self.settings)
         dlg.exec()
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow { background: #0f172a; color: #e5e7eb; }
-            QLabel { color: #cbd5e1; font-weight: 600; }
-            QGroupBox { border: 1px solid #1f2937; border-radius: 10px; margin-top: 10px; padding: 10px; color: #e5e7eb; font-weight: 600; }
-            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 6px; }
-            QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 8px; padding: 6px; }
-            QComboBox::drop-down { border: none; }
-            QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
-            QPushButton:hover { background: #1d4ed8; }
-            QPushButton:disabled { background: #334155; color: #9ca3af; }
-            QRadioButton { color: #e5e7eb; font-weight: normal; }
-            QHeaderView::section { background: #0b1220; color: #cbd5e1; padding: 6px; border: none; }
-            QTableWidget { gridline-color: #374151; }
-            QTableWidget::item { padding-left: 5px; }
-            QTabWidget::pane { border: 1px solid #1f2937; border-radius: 10px; } 
-            QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; } 
-            QTabBar::tab:selected { background: #2563eb; color: white; }
-        """)
+        theme = self.settings.get("theme", "dark")
+        style = DARK_STYLESHEET if theme == "dark" else LIGHT_STYLESHEET
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(style)
+        self._update_ai_button_style()
+
+    def open_settings_dialog(self):
+        dlg = SettingsDialog(self, self.settings)
+        if dlg.exec():
+            self._apply_style()
+
+    def show_about_dialog(self):
+        QMessageBox.information(
+            self,
+            "关于",
+            "SMART VLOOKUPER 1.1\n©梁诗忻 2025. 本项目采用MIT许可证。\n项目地址：https://github.com/liangshixin1/Smart-Vlookuper"
+        )
 
 def main():
     app = QApplication(sys.argv)
