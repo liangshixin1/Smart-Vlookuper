@@ -24,10 +24,11 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QAction
+from PyQt6.QtGui import QBrush, QColor, QAction, QTextCursor
 import gc
 from thefuzz import fuzz
 from copy import copy
+from typing import List
 
 # —— 静默 openpyxl 的数据验证扩展警告 ——
 warnings.filterwarnings(
@@ -506,6 +507,7 @@ class AIWorker(QThread):
                 f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。\n"
                 "请在宏内拆分 tableList，按需打开并处理这些工作簿，最终将结果保存到 outputPath 指定的路径。\n"
                 "不要弹出对话框或依赖任何交互，也不要修改除结果文件外的其他文件。\n"
+                "交互要求：在构思代码时，请同步准备一段代码执行成功后的反馈话术，先确认任务完成，再礼貌询问用户下一步需求。该话术无需写入代码，将在我们系统中展示给用户。\n"
                 "仅返回纯VBA代码，不要包含```标记或额外说明。"
             )
             retry_suffix = "请仅返回修正后的VBA代码。"
@@ -515,7 +517,8 @@ class AIWorker(QThread):
                 "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。\n"
                 f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。\n"
                 "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。\n"
-                "不要输出任何解释或额外文本，也不要包含```代码块标记。"
+                "不要输出任何解释或额外文本，也不要包含```代码块标记。\n"
+                "交互要求：在规划代码时，请准备一段成功完成任务后的反馈话术，先确认任务完成，再询问用户下一步需求。该话术无需写入代码，将由我们的系统在执行成功后提示用户。"
             )
             retry_suffix = "请仅返回修正后的Python代码。"
 
@@ -660,6 +663,101 @@ class AIWorker(QThread):
         self.error.emit((last_err or "执行失败") + f"\n\n最后的代码:\n{last_code}")
 
 
+class IntentWorker(QThread):
+    """识别上传表格的常见处理意图"""
+
+    results = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, api_key: str, tables: List[str]):
+        super().__init__()
+        self.api_key = api_key
+        self.tables = [str(p) for p in tables]
+
+    def run(self):
+        if not self.tables:
+            self.results.emit([])
+            return
+
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            self.error.emit(f"未安装openai库: {e}")
+            return
+
+        table_chunks = []
+        for path in self.tables:
+            if self.isInterruptionRequested():
+                return
+            try:
+                df = pd.read_excel(path).fillna("")
+            except Exception as e:
+                self.error.emit(f"无法读取表格：{path} - {e}")
+                return
+            sample_csv = df.head(5).to_csv(index=False)
+            columns = json.dumps([str(c) for c in df.columns], ensure_ascii=False)
+            table_chunks.append(
+                f"文件名: {Path(path).name}\n列名: {columns}\n数据样本:\n{sample_csv.strip()}"
+            )
+
+        prompt_text = "以下是一个或多个Excel表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
+
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                temperature=0.0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是一个精通Excel和数据处理的专家助理。你的任务是根据用户上传的表格的列名和少量示例数据，预测用户可能想要执行的几个最常见的操作。"
+                            "请仅以JSON数组的格式返回5个操作意图，每个意图为2-5个字且动词开头。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt_text},
+                ],
+            )
+        except Exception as e:
+            if not self.isInterruptionRequested():
+                self.error.emit(str(e))
+            return
+
+        if self.isInterruptionRequested():
+            return
+
+        content = ""
+        try:
+            content = (response.choices[0].message.content or "").strip()
+        except Exception:
+            self.error.emit("意图识别返回内容为空")
+            return
+
+        intents = None
+        try:
+            intents = json.loads(content)
+        except Exception:
+            try:
+                start = content.find("[")
+                end = content.rfind("]")
+                if start != -1 and end != -1 and end > start:
+                    intents = json.loads(content[start : end + 1])
+            except Exception:
+                intents = None
+
+        if not isinstance(intents, list):
+            self.error.emit("意图识别结果解析失败")
+            return
+
+        cleaned = []
+        for item in intents:
+            text = str(item).strip()
+            if text:
+                cleaned.append(text)
+
+        self.results.emit(cleaned[:5])
+
+
 def execute_vba_module(code: str, table_payload: str, output_path: Path):
     """在临时工作簿中插入并执行VBA代码"""
     try:
@@ -714,6 +812,9 @@ class AIHelperDialog(QDialog):
         self.worker = None
         self.awaiting_execution = False
         self._last_status_text = ""
+        self.intent_worker = None
+        self.recommend_buttons = []
+        self.recommend_placeholder = None
 
         main_layout = QHBoxLayout(self)
         main_layout.setSpacing(12)
@@ -726,9 +827,14 @@ class AIHelperDialog(QDialog):
         self.history_list.setWordWrap(True)
         self.history_list.itemDoubleClicked.connect(self.show_history_detail)
         history_layout.addWidget(self.history_list)
+        history_btn_row = QHBoxLayout()
+        self.btn_new_session = QPushButton("开启新对话")
+        self.btn_new_session.clicked.connect(self.start_new_session)
+        history_btn_row.addWidget(self.btn_new_session)
         self.btn_clear_history = QPushButton("清空历史")
         self.btn_clear_history.clicked.connect(self.clear_history)
-        history_layout.addWidget(self.btn_clear_history)
+        history_btn_row.addWidget(self.btn_clear_history)
+        history_layout.addLayout(history_btn_row)
         main_layout.addWidget(history_group, 1)
 
         center_group = QGroupBox("对话配置")
@@ -777,6 +883,13 @@ class AIHelperDialog(QDialog):
         self.message_edit.setMinimumHeight(140)
         center_layout.addWidget(self.message_edit)
 
+        self.recommend_container = QWidget()
+        self.recommend_layout = QHBoxLayout(self.recommend_container)
+        self.recommend_layout.setContentsMargins(0, 0, 0, 0)
+        self.recommend_layout.setSpacing(6)
+        center_layout.addWidget(self.recommend_container)
+        self._reset_recommend_placeholder("推荐操作将在此显示")
+
         self.btn_send = QPushButton("发送指令")
         self.btn_send.clicked.connect(self.send_message)
         center_layout.addWidget(self.btn_send)
@@ -794,6 +907,12 @@ class AIHelperDialog(QDialog):
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("执行日志与提示将显示在此处。")
         self.preview_tabs.addTab(self.log_view, "执行日志")
+        self.table_preview = QTableWidget()
+        self.table_preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_preview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_preview.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table_preview.horizontalHeader().setStretchLastSection(True)
+        self.preview_tabs.addTab(self.table_preview, "表格预览")
         preview_layout.addWidget(self.preview_tabs, 1)
         self.status_label = QLabel("等待指令…")
         preview_layout.addWidget(self.status_label)
@@ -820,6 +939,7 @@ class AIHelperDialog(QDialog):
                 added += 1
         if added:
             self.log_view.appendPlainText(f"系统：已添加 {added} 个表格。")
+            self.trigger_intent_recognition()
 
     def browse_output(self):
         current = self.output_edit.text().strip()
@@ -873,15 +993,159 @@ class AIHelperDialog(QDialog):
         dlg.resize(520, 320)
         dlg.exec()
 
-    def clear_history(self):
-        if not self.conversation_messages:
-            return
-        confirm = QMessageBox.question(self, "确认", "确定要清空历史对话吗？")
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+    def clear_history(self, checked=False, confirm_dialog=True):
+        del checked
+        if confirm_dialog and self.conversation_messages:
+            confirm = QMessageBox.question(self, "确认", "确定要清空历史对话吗？")
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
         self.conversation_messages.clear()
         self.history_list.clear()
         self.log_view.appendPlainText("系统：已清空历史对话。")
+
+    def start_new_session(self, checked=False):
+        del checked
+        if self.worker and self.worker.isRunning():
+            confirm = QMessageBox.question(
+                self,
+                "确认",
+                "当前有任务正在执行，是否取消并开启新对话？",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            self.cancel_current()
+
+        self._stop_intent_worker()
+        self.log_view.clear()
+        self.clear_history(confirm_dialog=False)
+        self.tables.clear()
+        self.table_list.clear()
+        self.message_edit.clear()
+        self.code_preview.clear()
+        self.table_preview.clear()
+        self.table_preview.setRowCount(0)
+        self.table_preview.setColumnCount(0)
+        self.preview_tabs.setCurrentWidget(self.code_preview)
+        self.status_label.setText("等待指令…")
+        self._last_status_text = ""
+        self.awaiting_execution = False
+        self.btn_execute.setEnabled(False)
+        self._reset_recommend_placeholder("推荐操作将在此显示")
+        self.log_view.appendPlainText("系统：已开启新对话，所有内容已重置。")
+
+    def _stop_intent_worker(self):
+        if self.intent_worker and self.intent_worker.isRunning():
+            self.intent_worker.requestInterruption()
+            self.intent_worker.wait(200)
+        self.intent_worker = None
+
+    def _clear_recommend_layout(self):
+        while self.recommend_layout.count():
+            item = self.recommend_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _reset_recommend_placeholder(self, text="推荐操作将在此显示"):
+        self.recommend_buttons.clear()
+        self._clear_recommend_layout()
+        label = QLabel(text)
+        label.setStyleSheet("color: #94a3b8;")
+        self.recommend_placeholder = label
+        self.recommend_layout.addWidget(label)
+        self.recommend_layout.addStretch()
+
+    def trigger_intent_recognition(self):
+        if not getattr(self, "recommend_layout", None):
+            return
+        if not self.tables:
+            self._reset_recommend_placeholder("推荐操作将在此显示")
+            return
+
+        api_key = (self.settings.get("ai_api_key", "") or "").strip()
+        if not api_key:
+            self._reset_recommend_placeholder("请在设置中填写API Key以获取推荐。")
+            return
+
+        self._reset_recommend_placeholder("正在分析常见操作…")
+        self.log_view.appendPlainText("系统：正在分析表格，推荐常见操作…")
+        self._stop_intent_worker()
+        self.intent_worker = IntentWorker(api_key, self.tables)
+        self.intent_worker.results.connect(self.on_intent_results)
+        self.intent_worker.error.connect(self.on_intent_error)
+        self.intent_worker.finished.connect(self.on_intent_finished)
+        self.intent_worker.start()
+
+    def on_intent_results(self, intents: List[str]):
+        self.recommend_buttons.clear()
+        self._clear_recommend_layout()
+        if not intents:
+            self._reset_recommend_placeholder("暂未获取推荐操作")
+            return
+
+        for text in intents:
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, t=text: self.on_recommendation_clicked(t))
+            self.recommend_layout.addWidget(btn)
+            self.recommend_buttons.append(btn)
+
+        self.recommend_layout.addStretch()
+        self.recommend_placeholder = None
+        self.log_view.appendPlainText("系统：推荐操作 → " + "、".join(intents))
+
+    def on_intent_error(self, message: str):
+        first_line = (message or "").splitlines()[0] if message else ""
+        self._reset_recommend_placeholder("未能获取推荐操作")
+        if first_line:
+            self.log_view.appendPlainText(f"系统：推荐操作生成失败：{first_line}")
+
+    def on_intent_finished(self):
+        self.intent_worker = None
+
+    def on_recommendation_clicked(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+        self.message_edit.setPlainText(text)
+        self.message_edit.moveCursor(QTextCursor.MoveOperation.End)
+        self.send_message()
+
+    def render_table_preview(self, path_str: str):
+        self.table_preview.clear()
+        self.table_preview.setRowCount(0)
+        self.table_preview.setColumnCount(0)
+        if not path_str:
+            return
+        try:
+            df = pd.read_excel(path_str)
+        except Exception as e:
+            self.log_view.appendPlainText(f"系统：无法加载表格预览：{e}")
+            return
+
+        preview_df = df.head(200)
+        columns = [str(c) for c in preview_df.columns]
+        self.table_preview.setColumnCount(len(columns))
+        if columns:
+            self.table_preview.setHorizontalHeaderLabels(columns)
+        self.table_preview.setRowCount(len(preview_df))
+        for row_idx, (_, row) in enumerate(preview_df.iterrows()):
+            for col_idx, value in enumerate(row):
+                display = "" if pd.isna(value) else str(value)
+                self.table_preview.setItem(row_idx, col_idx, QTableWidgetItem(display))
+
+        self.table_preview.resizeColumnsToContents()
+        self.preview_tabs.setCurrentWidget(self.table_preview)
+
+    def _adopt_result_table(self, path_str: str):
+        if not path_str:
+            return
+        path_str = str(path_str)
+        self.tables = [path_str]
+        self.table_list.clear()
+        self.table_list.addItem(path_str)
+        self.log_view.appendPlainText("系统：合并成功，已将生成结果设定为当前处理表格。")
+        self.render_table_preview(path_str)
+        self.trigger_intent_recognition()
 
     def send_message(self):
         if self.worker and self.worker.isRunning():
@@ -994,11 +1258,12 @@ class AIHelperDialog(QDialog):
         self._last_status_text = "代码生成完成，请确认后执行。"
 
     def on_worker_success(self, path_str: str):
-        msg = f"操作成功，结果已保存到：{path_str}"
+        msg = f"表格处理已完成，结果保存在：{path_str}。还需要我继续协助处理这个结果吗？"
         self.append_history("assistant", msg)
         self.log_view.appendPlainText(f"成功：{path_str}")
         self.status_label.setText("执行完成")
         self._last_status_text = "执行完成"
+        self._adopt_result_table(path_str)
         QMessageBox.information(self, "执行完成", f"已生成文件：\n{path_str}")
 
     def on_worker_error(self, err: str):
@@ -1035,6 +1300,7 @@ class AIHelperDialog(QDialog):
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
             self.cancel_current()
+        self._stop_intent_worker()
         super().closeEvent(event)
 
 
