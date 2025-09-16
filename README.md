@@ -6,6 +6,8 @@ Smart VLookUper 智能数据映射工具
 
 采用COM批量写入优化性能，保持原Excel格式不变。集成DeepSeek AI，支持自然语言描述数据处理需求。
 
+全新的AI助手窗口支持历史对话、多轮指令与实时代码/执行日志预览，可将复杂任务拆分为多步链式操作，逐步验证每一步的结果。
+
 必备库： pyqt6 pandas openpyxl pywin32 thefuzz openai
 
 支持Windows/macOS/Linux，推荐Windows获得最佳性能。

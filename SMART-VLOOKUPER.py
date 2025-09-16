@@ -18,9 +18,9 @@ from openpyxl.utils import get_column_letter
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
-    QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
+    QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QButtonGroup, QTabWidget, QDialog, QPlainTextEdit, QProgressDialog,
+    QTabWidget, QDialog, QPlainTextEdit,
     QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -428,7 +428,7 @@ class AIWorker(QThread):
     code_stream = pyqtSignal(str)
     code_ready = pyqtSignal(str)
 
-    def __init__(self, api_key, tables, instruction, temperature, language, output_path):
+    def __init__(self, api_key, tables, instruction, temperature, language, output_path, conversation_history=None):
         super().__init__()
         self.api_key = api_key
         self.tables = [str(p) for p in tables]
@@ -437,6 +437,7 @@ class AIWorker(QThread):
         self.language = language
         self.output_path = Path(output_path)
         self.approval_event = threading.Event()
+        self.history = conversation_history or []
 
     def approve_execution(self):
         self.approval_event.set()
@@ -473,28 +474,52 @@ class AIWorker(QThread):
         table_info_text = "\n\n".join(table_texts)
         language_key = self.language.lower()
 
+        history_lines = []
+        for msg in self.history:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            prefix = "用户" if role == "user" else "助手"
+            history_lines.append(f"{prefix}：{content}")
+
+        conversation_text = "\n".join(history_lines)
+        if conversation_text:
+            conversation_block = (
+                "以下是之前的对话历史，请在继续编写代码时保持上下文一致：\n"
+                f"{conversation_text}\n\n"
+            )
+        else:
+            conversation_block = ""
+
+        task_block = (
+            f"{conversation_block}"
+            f"当前用户最新指令：\n{self.instruction}\n\n"
+            f"可用的Excel表格信息：\n{table_info_text}"
+        )
+
         if language_key == "vba":
-            base_prompt = (
-                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成VBA代码。"
-                "必须声明一个入口宏：Sub ProcessTables(tableList As String, outputPath As String)。"
-                "参数 tableList 为使用换行分隔的完整Excel路径字符串；outputPath 为结果Excel文件的完整保存路径。"
-                f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。"
-                "请在宏内拆分 tableList，按需打开并处理这些工作簿，最终将结果保存到 outputPath 指定的路径。"
-                "不要弹出对话框或依赖任何交互，也不要修改除结果文件外的其他文件。"
+            env_instructions = (
+                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成VBA代码。\n"
+                "必须声明一个入口宏：Sub ProcessTables(tableList As String, outputPath As String)。\n"
+                "参数 tableList 为使用换行分隔的完整Excel路径字符串；outputPath 为结果Excel文件的完整保存路径。\n"
+                f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。\n"
+                "请在宏内拆分 tableList，按需打开并处理这些工作簿，最终将结果保存到 outputPath 指定的路径。\n"
+                "不要弹出对话框或依赖任何交互，也不要修改除结果文件外的其他文件。\n"
                 "仅返回纯VBA代码，不要包含```标记或额外说明。"
-                f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n{table_info_text}"
             )
             retry_suffix = "请仅返回修正后的VBA代码。"
         else:
-            base_prompt = (
-                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成可直接运行的Python代码以满足用户需求。"
-                "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。"
-                f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。"
-                "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。"
-                "不要输出任何解释或额外文本。"
-                f"\n\n用户需求：\n{self.instruction}\n\n表格信息：\n{table_info_text}"
+            env_instructions = (
+                "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成可直接运行的Python代码以满足用户需求。\n"
+                "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。\n"
+                f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。\n"
+                "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。\n"
+                "不要输出任何解释或额外文本，也不要包含```代码块标记。"
             )
             retry_suffix = "请仅返回修正后的Python代码。"
+
+        base_prompt = env_instructions + "\n\n" + task_block
 
 
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
@@ -682,11 +707,33 @@ class AIHelperDialog(QDialog):
     def __init__(self, parent, settings: AppSettings):
         super().__init__(parent)
         self.setWindowTitle("AI助手")
+        self.resize(1200, 650)
         self.settings = settings
         self.tables = []
-        layout = QVBoxLayout(self)
+        self.conversation_messages = []
+        self.worker = None
+        self.awaiting_execution = False
+        self._last_status_text = ""
 
-        layout.addWidget(QLabel("使用场景:"))
+        main_layout = QHBoxLayout(self)
+        main_layout.setSpacing(12)
+
+        history_group = QGroupBox("历史对话")
+        history_group.setMinimumWidth(220)
+        history_layout = QVBoxLayout(history_group)
+        self.history_list = QListWidget()
+        self.history_list.setAlternatingRowColors(True)
+        self.history_list.setWordWrap(True)
+        self.history_list.itemDoubleClicked.connect(self.show_history_detail)
+        history_layout.addWidget(self.history_list)
+        self.btn_clear_history = QPushButton("清空历史")
+        self.btn_clear_history.clicked.connect(self.clear_history)
+        history_layout.addWidget(self.btn_clear_history)
+        main_layout.addWidget(history_group, 1)
+
+        center_group = QGroupBox("对话配置")
+        center_layout = QVBoxLayout(center_group)
+        center_layout.addWidget(QLabel("使用场景:"))
         self.scenario_combo = QComboBox()
         self.scenario_combo.addItems([
             "代码生成/数学解题",
@@ -695,26 +742,23 @@ class AIHelperDialog(QDialog):
             "翻译",
             "创意类写作/诗歌创作"
         ])
-        layout.addWidget(self.scenario_combo)
+        center_layout.addWidget(self.scenario_combo)
 
         self.btn_add_table = QPushButton("添加表格")
         self.btn_add_table.clicked.connect(self.add_table)
-        layout.addWidget(self.btn_add_table)
+        center_layout.addWidget(self.btn_add_table)
 
         self.table_list = QListWidget()
-        layout.addWidget(self.table_list)
+        self.table_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table_list.setMinimumHeight(120)
+        center_layout.addWidget(self.table_list, 1)
 
-        layout.addWidget(QLabel("需求说明:"))
-        self.instruction_edit = QPlainTextEdit()
-        self.instruction_edit.setPlaceholderText("请用自然语言描述您的需求")
-        layout.addWidget(self.instruction_edit)
-
-        layout.addWidget(QLabel("生成代码语言:"))
+        center_layout.addWidget(QLabel("生成代码语言:"))
         self.language_combo = QComboBox()
         self.language_combo.addItems(["Python", "VBA"])
-        layout.addWidget(self.language_combo)
+        center_layout.addWidget(self.language_combo)
 
-        layout.addWidget(QLabel("导出结果路径:"))
+        center_layout.addWidget(QLabel("导出结果路径:"))
         path_layout = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("请选择AI生成结果的保存路径")
@@ -725,20 +769,57 @@ class AIHelperDialog(QDialog):
         btn_browse.clicked.connect(self.browse_output)
         path_layout.addWidget(self.output_edit, 1)
         path_layout.addWidget(btn_browse)
-        layout.addLayout(path_layout)
+        center_layout.addLayout(path_layout)
 
-        self.btn_run = QPushButton("执行")
-        self.btn_run.clicked.connect(self.run_ai)
-        layout.addWidget(self.btn_run)
+        center_layout.addWidget(QLabel("对话输入:"))
+        self.message_edit = QPlainTextEdit()
+        self.message_edit.setPlaceholderText("请用自然语言描述下一步操作，例如：先帮我合并这两个表格")
+        self.message_edit.setMinimumHeight(140)
+        center_layout.addWidget(self.message_edit)
 
-        self.worker = None
+        self.btn_send = QPushButton("发送指令")
+        self.btn_send.clicked.connect(self.send_message)
+        center_layout.addWidget(self.btn_send)
+        center_layout.addStretch()
+        main_layout.addWidget(center_group, 2)
+
+        preview_group = QGroupBox("预览")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_tabs = QTabWidget()
+        self.code_preview = QPlainTextEdit()
+        self.code_preview.setReadOnly(True)
+        self.code_preview.setPlaceholderText("AI生成的代码将实时显示在此处。")
+        self.preview_tabs.addTab(self.code_preview, "代码预览")
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("执行日志与提示将显示在此处。")
+        self.preview_tabs.addTab(self.log_view, "执行日志")
+        preview_layout.addWidget(self.preview_tabs, 1)
+        self.status_label = QLabel("等待指令…")
+        preview_layout.addWidget(self.status_label)
+        btn_row = QHBoxLayout()
+        self.btn_execute = QPushButton("执行生成代码")
+        self.btn_execute.setEnabled(False)
+        self.btn_execute.clicked.connect(self.exec_generated_code)
+        self.btn_cancel = QPushButton("取消当前操作")
+        self.btn_cancel.clicked.connect(self.cancel_current)
+        btn_row.addWidget(self.btn_execute)
+        btn_row.addWidget(self.btn_cancel)
+        preview_layout.addLayout(btn_row)
+        main_layout.addWidget(preview_group, 2)
 
     def add_table(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择表格", "", "Excel Files (*.xlsx *.xlsm *.xls)")
-        if paths:
-            self.tables.extend(paths)
-            for p in paths:
+        if not paths:
+            return
+        added = 0
+        for p in paths:
+            if p not in self.tables:
+                self.tables.append(p)
                 self.table_list.addItem(p)
+                added += 1
+        if added:
+            self.log_view.appendPlainText(f"系统：已添加 {added} 个表格。")
 
     def browse_output(self):
         current = self.output_edit.text().strip()
@@ -763,17 +844,62 @@ class AIHelperDialog(QDialog):
             self.output_edit.setText(str(p))
             self.settings.update(last_ai_export_path=str(p))
 
-    def run_ai(self):
+    def append_history(self, role: str, content: str):
+        content = (content or "").strip()
+        if not content:
+            return
+        prefix = "👤" if role == "user" else "🤖"
+        first_line = content.splitlines()[0]
+        if len(first_line) > 60:
+            first_line = first_line[:60] + "…"
+        item = QListWidgetItem(f"{prefix} {first_line}")
+        item.setData(Qt.ItemDataRole.UserRole, content)
+        self.history_list.addItem(item)
+        self.history_list.scrollToBottom()
+        self.conversation_messages.append({"role": role, "content": content})
+
+    def show_history_detail(self, item):
+        content = item.data(Qt.ItemDataRole.UserRole) or ""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("对话详情")
+        lay = QVBoxLayout(dlg)
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(content)
+        lay.addWidget(txt)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.resize(520, 320)
+        dlg.exec()
+
+    def clear_history(self):
+        if not self.conversation_messages:
+            return
+        confirm = QMessageBox.question(self, "确认", "确定要清空历史对话吗？")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.conversation_messages.clear()
+        self.history_list.clear()
+        self.log_view.appendPlainText("系统：已清空历史对话。")
+
+    def send_message(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "提示", "当前有任务正在执行，请稍候。")
+            return
+
         api_key = (self.settings.get("ai_api_key", "") or "").strip()
         if not api_key:
             QMessageBox.warning(self, "提示", "请先在“设置”中填写API Key。")
             return
+
         if not self.tables:
             QMessageBox.warning(self, "提示", "请至少添加一个表格")
             return
-        instruction = self.instruction_edit.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请填写需求说明")
+
+        message = self.message_edit.toPlainText().strip()
+        if not message:
+            QMessageBox.warning(self, "提示", "请填写对话指令")
             return
 
         output_path_text = self.output_edit.text().strip()
@@ -805,95 +931,111 @@ class AIHelperDialog(QDialog):
         temperature = temp_map.get(self.scenario_combo.currentText(), 0.0)
         language = self.language_combo.currentText()
 
-        self.btn_run.setEnabled(False)
-        progress = QProgressDialog("准备中...", "取消", 0, 0, self)
-        progress.setWindowTitle("执行中")
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        history_snapshot = [msg.copy() for msg in self.conversation_messages]
+        self.append_history("user", message)
+        self.log_view.appendPlainText(f"用户：{message}")
+        self.log_view.appendPlainText("")
 
-        self.worker = AIWorker(api_key, self.tables, instruction, temperature, language, str(output_path))
+        self.message_edit.clear()
+        self.code_preview.clear()
+        self.preview_tabs.setCurrentIndex(0)
+        self.status_label.setText("准备中…")
+        self._last_status_text = ""
+        self.btn_send.setEnabled(False)
+        self.btn_execute.setEnabled(False)
+        self.awaiting_execution = False
 
-        code_dlg = QDialog(self)
-        code_dlg.setWindowTitle("模型代码")
-        lay = QVBoxLayout(code_dlg)
-        lay.addWidget(QLabel(f"模型正在生成{language}代码："))
-        code_view = QPlainTextEdit()
-        code_view.setReadOnly(True)
-        lay.addWidget(code_view)
-        warn = QLabel("<font color='red'>执行外部代码存在风险，请确保其安全。</font>")
-        lay.addWidget(warn)
-        btn_box = QHBoxLayout()
-        btn_exec = QPushButton("执行")
-        btn_exec.setEnabled(False)
-        btn_cancel = QPushButton("取消")
-        btn_box.addWidget(btn_exec)
-        btn_box.addWidget(btn_cancel)
-        lay.addLayout(btn_box)
+        self.worker = AIWorker(api_key, self.tables, message, temperature, language, str(output_path), history_snapshot)
+        self.worker.progress.connect(self.on_worker_progress)
+        self.worker.code_stream.connect(self.on_worker_code_stream)
+        self.worker.code_ready.connect(self.on_worker_code_ready)
+        self.worker.success.connect(self.on_worker_success)
+        self.worker.error.connect(self.on_worker_error)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
 
-        def cancel_all():
-            if self.worker:
-                self.worker.requestInterruption()
-                self.worker.approve_execution()
-            progress.cancel()
-            code_dlg.close()
+    def exec_generated_code(self):
+        if not (self.worker and self.worker.isRunning() and self.awaiting_execution):
+            return
+        self.awaiting_execution = False
+        self.btn_execute.setEnabled(False)
+        self.status_label.setText("执行中…")
+        self.log_view.appendPlainText("系统：开始执行生成的代码。")
+        self.worker.approve_execution()
 
-        btn_cancel.clicked.connect(cancel_all)
-        code_dlg.rejected.connect(cancel_all)
-        progress.canceled.connect(cancel_all)
-        self.worker.progress.connect(progress.setLabelText)
+    def cancel_current(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.approve_execution()
+            self.status_label.setText("已请求取消…")
+            self.log_view.appendPlainText("系统：已请求取消当前任务。")
+            self.awaiting_execution = False
+            self.btn_execute.setEnabled(False)
+        else:
+            self.log_view.appendPlainText("系统：当前没有正在执行的任务。")
 
-        def update_code(text: str):
-            code_view.setPlainText(text)
-            sb = code_view.verticalScrollBar()
-            sb.setValue(sb.maximum())
+    def on_worker_progress(self, text: str):
+        self.status_label.setText(text)
+        if text and text != self._last_status_text:
+            self.log_view.appendPlainText(f"系统：{text}")
+            self._last_status_text = text
 
-        self.worker.code_stream.connect(update_code)
+    def on_worker_code_stream(self, text: str):
+        self.code_preview.setPlainText(text)
+        sb = self.code_preview.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
-        def on_code_ready(c: str):
-            update_code(c)
-            btn_exec.setEnabled(True)
-            progress.hide()
+    def on_worker_code_ready(self, text: str):
+        self.on_worker_code_stream(text)
+        self.awaiting_execution = True
+        self.btn_execute.setEnabled(True)
+        self.status_label.setText("代码生成完成，请确认后执行。")
+        self.log_view.appendPlainText("系统：模型已生成代码，等待执行。")
+        self._last_status_text = "代码生成完成，请确认后执行。"
 
-        self.worker.code_ready.connect(on_code_ready)
+    def on_worker_success(self, path_str: str):
+        msg = f"操作成功，结果已保存到：{path_str}"
+        self.append_history("assistant", msg)
+        self.log_view.appendPlainText(f"成功：{path_str}")
+        self.status_label.setText("执行完成")
+        self._last_status_text = "执行完成"
+        QMessageBox.information(self, "执行完成", f"已生成文件：\n{path_str}")
 
-        code_dlg.show()
-        progress.show()
-
-        def exec_and_show_progress():
-            progress.setLabelText("执行中...")
-            progress.show()
-            if self.worker:
-                self.worker.approve_execution()
-            code_dlg.accept()
-
-        btn_exec.clicked.connect(exec_and_show_progress)
-
-        def on_success(path_str):
-            progress.close()
-            code_dlg.close()
-            QMessageBox.information(self, "执行完成", f"已生成文件：\n{path_str}")
-
-        def on_error(err):
-            progress.close()
-            code_dlg.close()
+    def on_worker_error(self, err: str):
+        err = (err or "").strip()
+        first_line = err.splitlines()[0] if err else "未知错误"
+        self.append_history("assistant", f"执行失败：{first_line}")
+        if err:
+            self.log_view.appendPlainText("错误：")
+            self.log_view.appendPlainText(err)
+        self.status_label.setText("执行失败")
+        self._last_status_text = "执行失败"
+        if first_line != "已取消":
             dlg = QDialog(self)
             dlg.setWindowTitle("错误")
             lay = QVBoxLayout(dlg)
-            lay.addWidget(QLabel("执行失败，以下是错误信息及最后生成的代码："))
+            lay.addWidget(QLabel("执行失败，以下是错误信息："))
             txt = QPlainTextEdit()
-            txt.setPlainText(err)
             txt.setReadOnly(True)
+            txt.setPlainText(err)
             lay.addWidget(txt)
             btn = QPushButton("关闭")
             btn.clicked.connect(dlg.accept)
             lay.addWidget(btn)
+            dlg.resize(520, 320)
             dlg.exec()
 
-        self.worker.success.connect(on_success)
-        self.worker.error.connect(on_error)
-        self.worker.finished.connect(progress.close)
-        self.worker.finished.connect(code_dlg.close)
-        self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
-        self.worker.start()
+    def on_worker_finished(self):
+        self.worker = None
+        self.awaiting_execution = False
+        self.btn_execute.setEnabled(False)
+        self.btn_send.setEnabled(True)
+        self._last_status_text = ""
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.cancel_current()
+        super().closeEvent(event)
 
 
 class SettingsDialog(QDialog):
