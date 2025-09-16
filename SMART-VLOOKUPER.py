@@ -84,35 +84,51 @@ class AppSettings:
         self.save()
 
 
+PINK_ACCENT = "#F083A2"
+PINK_ACCENT_HOVER = "#D96B8D"
+
+
 DARK_STYLESHEET = """
-    QMainWindow { background: #0f172a; color: #e5e7eb; }
-    QLabel { color: #cbd5e1; font-weight: 600; }
-    QGroupBox { border: 1px solid #1f2937; border-radius: 10px; margin-top: 10px; padding: 10px; color: #e5e7eb; font-weight: 600; }
+    QMainWindow { background: #0f172a; color: #f8fafc; }
+    QMenuBar { background: #0f172a; color: #f8fafc; }
+    QMenuBar::item { background: transparent; color: #f8fafc; padding: 4px 12px; }
+    QMenuBar::item:selected { background: #1e293b; color: #f8fafc; }
+    QMenu { background: #111827; color: #f8fafc; border: 1px solid #1f2937; }
+    QMenu::item:selected { background: #1f2937; }
+    QDialog, QMessageBox { background: #0f172a; color: #f8fafc; }
+    QLabel { color: #f1f5f9; font-weight: 600; }
+    QGroupBox { border: 1px solid #1f2937; border-radius: 10px; margin-top: 10px; padding: 10px; color: #f8fafc; font-weight: 600; }
     QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 6px; }
-    QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 8px; padding: 6px; }
+    QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #111827; color: #f8fafc; border: 1px solid #374151; border-radius: 8px; padding: 6px; }
     QComboBox::drop-down { border: none; }
-    QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
-    QPushButton:hover { background: #1d4ed8; }
+    QPushButton { background: %(accent)s; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
+    QPushButton:hover { background: %(accent_hover)s; }
     QPushButton:disabled { background: #334155; color: #9ca3af; }
-    QRadioButton { color: #e5e7eb; font-weight: normal; }
-    QHeaderView::section { background: #0b1220; color: #cbd5e1; padding: 6px; border: none; }
+    QRadioButton { color: #f8fafc; font-weight: normal; }
+    QHeaderView::section { background: #0b1220; color: #f1f5f9; padding: 6px; border: none; }
     QTableWidget { gridline-color: #374151; }
     QTableWidget::item { padding-left: 5px; }
     QTabWidget::pane { border: 1px solid #1f2937; border-radius: 10px; }
-    QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
-    QTabBar::tab:selected { background: #2563eb; color: white; }
-"""
+    QTabBar::tab { background: #1e293b; color: #f1f5f9; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
+    QTabBar::tab:selected { background: %(accent)s; color: white; }
+""" % {"accent": PINK_ACCENT, "accent_hover": PINK_ACCENT_HOVER}
 
 
 LIGHT_STYLESHEET = """
     QMainWindow { background: #f8fafc; color: #0f172a; }
+    QMenuBar { background: #f8fafc; color: #0f172a; }
+    QMenuBar::item { background: transparent; color: #0f172a; padding: 4px 12px; }
+    QMenuBar::item:selected { background: #e2e8f0; color: #0f172a; }
+    QMenu { background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; }
+    QMenu::item:selected { background: #e2e8f0; }
+    QDialog, QMessageBox { background: #f8fafc; color: #0f172a; }
     QLabel { color: #0f172a; font-weight: 600; }
     QGroupBox { border: 1px solid #cbd5e1; border-radius: 10px; margin-top: 10px; padding: 10px; color: #0f172a; font-weight: 600; background: #ffffff; }
     QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 6px; }
     QLineEdit, QComboBox, QSpinBox, QListWidget, QTableWidget { background: #ffffff; color: #111827; border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px; }
     QComboBox::drop-down { border: none; }
-    QPushButton { background: #2563eb; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
-    QPushButton:hover { background: #1d4ed8; }
+    QPushButton { background: %(accent)s; color: white; border: none; border-radius: 8px; padding: 8px 12px; font-weight: 600; }
+    QPushButton:hover { background: %(accent_hover)s; }
     QPushButton:disabled { background: #cbd5e1; color: #94a3b8; }
     QRadioButton { color: #0f172a; font-weight: normal; }
     QHeaderView::section { background: #e2e8f0; color: #1e293b; padding: 6px; border: none; }
@@ -120,8 +136,8 @@ LIGHT_STYLESHEET = """
     QTableWidget::item { padding-left: 5px; }
     QTabWidget::pane { border: 1px solid #cbd5e1; border-radius: 10px; background: #ffffff; }
     QTabBar::tab { background: #e2e8f0; color: #1e293b; padding: 6px 12px; margin: 2px; border-top-left-radius: 6px; border-top-right-radius: 6px; }
-    QTabBar::tab:selected { background: #2563eb; color: white; }
-"""
+    QTabBar::tab:selected { background: %(accent)s; color: white; }
+""" % {"accent": PINK_ACCENT, "accent_hover": PINK_ACCENT_HOVER}
 
 # ===================== 基础工具与模糊匹配 =====================
 
