@@ -496,12 +496,14 @@ class AIWorker(QThread):
         task_block = (
             f"{conversation_block}"
             f"当前用户最新指令：\n{self.instruction}\n\n"
-            f"可用的Excel表格信息：\n{table_info_text}"
+            f"可用的Excel表格信息：\n{table_info_text}\n\n"
+            "以上绝对路径已由系统自动注入运行环境，无需等待用户重复提供。请直接使用这些路径，避免出现“Required Files Not Found”错误。"
         )
 
         if language_key == "vba":
             env_instructions = (
                 "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成VBA代码。\n"
+                "生成代码时必须直接使用提供的完整文件路径，避免因路径错误导致“Required Files Not Found”。\n"
                 "必须声明一个入口宏：Sub ProcessTables(tableList As String, outputPath As String)。\n"
                 "参数 tableList 为使用换行分隔的完整Excel路径字符串；outputPath 为结果Excel文件的完整保存路径。\n"
                 f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。\n"
@@ -514,6 +516,7 @@ class AIWorker(QThread):
         else:
             env_instructions = (
                 "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成可直接运行的Python代码以满足用户需求。\n"
+                "生成代码时必须直接使用提供的完整文件路径，避免因路径错误导致“Required Files Not Found”。\n"
                 "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。\n"
                 f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。\n"
                 "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。\n"
@@ -879,7 +882,7 @@ class AIHelperDialog(QDialog):
 
         center_layout.addWidget(QLabel("对话输入:"))
         self.message_edit = QPlainTextEdit()
-        self.message_edit.setPlaceholderText("请用自然语言描述下一步操作，例如：先帮我合并这两个表格")
+        self.message_edit.setPlaceholderText("请用自然语言描述下一步操作，例如：合并客户表的电话字段。系统会自动提供所选表格的完整路径。")
         self.message_edit.setMinimumHeight(140)
         center_layout.addWidget(self.message_edit)
 
@@ -931,14 +934,17 @@ class AIHelperDialog(QDialog):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择表格", "", "Excel Files (*.xlsx *.xlsm *.xls)")
         if not paths:
             return
-        added = 0
+        new_paths = []
         for p in paths:
             if p not in self.tables:
                 self.tables.append(p)
                 self.table_list.addItem(p)
-                added += 1
-        if added:
-            self.log_view.appendPlainText(f"系统：已添加 {added} 个表格。")
+                new_paths.append(p)
+        if new_paths:
+            self.log_view.appendPlainText(f"系统：已添加 {len(new_paths)} 个表格。")
+            self.log_view.appendPlainText("系统：以下完整路径已同步给AI，您无需在指令中重复填写，供确认参考：")
+            for path in new_paths:
+                self.log_view.appendPlainText(f"    {path}")
             self.trigger_intent_recognition()
 
     def browse_output(self):

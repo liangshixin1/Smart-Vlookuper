@@ -8,6 +8,8 @@ Smart VLookUper 智能数据映射工具
 
 全新的AI助手窗口支持历史对话、多轮指令与实时代码/执行日志预览，可将复杂任务拆分为多步链式操作，逐步验证每一步的结果。
 
+AI助手会自动将已选择的Excel文件绝对路径传递给模型，用户只需描述处理目标即可，系统会在后台引用正确路径以避免“Required Files Not Found”等访问错误。
+
 必备库： pyqt6 pandas openpyxl pywin32 thefuzz openai
 
 支持Windows/macOS/Linux，推荐Windows获得最佳性能。
