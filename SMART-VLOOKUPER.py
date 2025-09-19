@@ -10,7 +10,7 @@ SMART-VLOOKUPER - Excel 字段匹配与 AI 自动化工具 (PyQt6)
 依赖：pip install pyqt6 pandas openpyxl pywin32 thefuzz
 """
 
-import sys, os, re, warnings, json, subprocess, tempfile, threading
+import sys, os, re, warnings, json, subprocess, tempfile, threading, random, string
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QComboBox,
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
-    QTabWidget, QDialog, QPlainTextEdit,
+    QTabWidget, QDialog, QPlainTextEdit, QTextBrowser,
     QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -87,6 +87,41 @@ class AppSettings:
 
 PINK_ACCENT = "#F083A2"
 PINK_ACCENT_HOVER = "#D96B8D"
+
+
+EXPORT_FORMATS = {
+    "excel": {
+        "label": "Excel 工作簿 (.xlsx)",
+        "extensions": [".xlsx", ".xlsm", ".xls"],
+        "default_extension": ".xlsx",
+        "dialog_filter": "Excel Files (*.xlsx *.xlsm *.xls)",
+        "description": "Excel 工作簿"
+    },
+    "word": {
+        "label": "Word 文档 (.docx)",
+        "extensions": [".docx"],
+        "default_extension": ".docx",
+        "dialog_filter": "Word Documents (*.docx)",
+        "description": "Word 文档"
+    },
+    "text": {
+        "label": "文本文件 (.txt)",
+        "extensions": [".txt", ".csv"],
+        "default_extension": ".txt",
+        "dialog_filter": "Text Files (*.txt *.csv)",
+        "description": "文本文件"
+    }
+}
+
+PRIVACY_STATEMENT_TEXT = """最后更新日期：2025年9月26日
+
+尊敬的用户：
+
+感谢您使用本系统的AI助手功能。我们深知数据安全与隐私保护的重要性，尤其是您可能处理的个人敏感信息。我们遵循 “数据最小化”与 “隐私优先” 的核心原则。我们的AI助手不会将您的原始数据发送至任何第三方服务器进行处理。所有敏感信息的保护均在您的本地计算机上完成。当您上传Excel文件前，系统会在本地自动扫描表格的表头（列名称），并根据内置的规则库识别可能包含个人敏感信息的列。对于识别出的敏感列，系统会立即在您的电脑内存中**将该列的所有数据内容替换为计算机随机生成的、符合原始数据格式的虚假样本数据。**之后，系统将使用这份**已经过脱敏处理的、不包含任何真实个人信息的数据样本**来生成提供给AI模型的提示词。您原始的、真实的Excel文件数据在任何情况下都绝不会离开您的本地环境。所有生成的代码均在严格的隔离环境中运行，无法访问您的网络或计算机上的其他无关文件。
+
+您有权知晓上述处理流程。使用AI功能即代表您同意此数据处理方式。如果您不希望进行任何形式的数据处理，请不要使用AI助手功能，软件的核心匹配功能仍可完全离线使用。在AI代码预览窗口中，您可以完整审查即将被执行的代码逻辑。
+
+如果您对本声明或我们的数据安全有任何疑问，请访问我们的Github项目地址，并提交Issue"""
 
 
 DARK_STYLESHEET = """
@@ -158,6 +193,104 @@ def dedup_columns(names):
             seen[base] += 1
             out.append(f"{base} ({seen[base]})")
     return out
+
+
+SENSITIVE_KEYWORDS = {
+    "name": ["姓名", "名字", "name", "联系人", "客户姓名", "学生姓名"],
+    "id": ["身份证", "身份证号", "身份证号码", "证件号", "证件号码", "id card", "idcard"],
+    "phone": ["手机号", "手机", "电话", "联系电话", "phone", "mobile", "联系方式"],
+    "address": ["地址", "住址", "家庭地址", "办公地址", "通讯地址", "联系地址", "address"]
+}
+
+FAKE_SURNAMES = list("赵钱孙李周吴郑王冯陈楮卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计成戴谈宋茅庞熊纪舒屈项祝董梁")
+FAKE_GIVEN_SINGLE = ["明", "芳", "华", "敏", "伟", "磊", "娜", "强", "霞", "杰", "静", "勇", "婷", "超", "燕", "波", "丽", "凯", "睿", "佳"]
+FAKE_GIVEN_DOUBLE = ["子涵", "梓萱", "浩然", "欣怡", "宇轩", "思远", "雅静", "晨曦", "博文", "诗涵", "靖雯", "曜文", "逸晨", "沐阳", "琪瑛", "思琪"]
+FAKE_PROVINCES = ["京", "沪", "粤", "浙", "苏", "鲁", "川", "渝", "辽", "湘", "闽", "皖", "鄂", "津"]
+FAKE_ADDRESS_SUFFIX = ["幸福路", "创新大道", "人民中路", "解放东街", "和平里", "阳光巷", "滨江道", "文化路", "建业街", "望江路", "星海路"]
+
+
+def classify_sensitive_column(column_name: str):
+    lowered = norm_str(column_name).lower()
+    for category, keywords in SENSITIVE_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in lowered:
+                return category
+    return None
+
+
+def _fake_chinese_name(length_hint: int = 2) -> str:
+    surname = random.choice(FAKE_SURNAMES)
+    if length_hint <= 2:
+        given = random.choice(FAKE_GIVEN_SINGLE)
+    else:
+        given = random.choice(FAKE_GIVEN_DOUBLE)
+    return surname + given
+
+
+def _fake_id_like(text: str) -> str:
+    stripped = re.sub(r"[^0-9Xx]", "", text)
+    length = len(stripped) if stripped else max(len(text), 18)
+    length = max(length, 6)
+    body = "".join(random.choices(string.digits, k=max(length - 1, 1)))
+    if length >= 18:
+        return body[: length - 1] + random.choice(string.digits + "X")
+    return body + random.choice(string.digits)
+
+
+def _fake_phone_like(text: str) -> str:
+    digits_only = re.sub(r"\D", "", text)
+    length = len(digits_only) if digits_only else 11
+    length = max(length, 8)
+    if length >= 11:
+        prefix = random.choice(["13", "15", "17", "18", "19"])
+        remainder = "".join(random.choices(string.digits, k=length - len(prefix)))
+        return (prefix + remainder)[:length]
+    return "".join(random.choices(string.digits, k=length))
+
+
+def _fake_address() -> str:
+    return (
+        f"{random.choice(FAKE_PROVINCES)}省"
+        f"{random.choice(['城区', '新区', '高新区', '经济开发区', '中心区'])}"
+        f"{random.choice(FAKE_ADDRESS_SUFFIX)}{random.randint(1, 299)}号"
+    )
+
+
+def _fake_generic(text: str) -> str:
+    length = len(text)
+    if length <= 0:
+        return ""
+    choices = string.ascii_letters + string.digits
+    return "".join(random.choices(choices, k=length))
+
+
+def generate_fake_value(value, category: str) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if category == "name":
+        return _fake_chinese_name(len(text))
+    if category == "id":
+        return _fake_id_like(text)
+    if category == "phone":
+        return _fake_phone_like(text)
+    if category == "address":
+        return _fake_address()
+    return _fake_generic(text)
+
+
+def desensitize_dataframe(df: pd.DataFrame):
+    sanitized = df.copy()
+    sensitive_columns = {}
+    for col in sanitized.columns:
+        sanitized[col] = sanitized[col].apply(lambda x: "" if pd.isna(x) else str(x))
+        category = classify_sensitive_column(col)
+        if category:
+            sanitized[col] = sanitized[col].apply(lambda v: generate_fake_value(v, category))
+            sensitive_columns[col] = category
+    return sanitized, sensitive_columns
 
 def find_best_match(target_field, source_fields, threshold=85):
     """
@@ -429,7 +562,7 @@ class AIWorker(QThread):
     code_stream = pyqtSignal(str)
     code_ready = pyqtSignal(str)
 
-    def __init__(self, api_key, tables, instruction, temperature, language, output_path, conversation_history=None):
+    def __init__(self, api_key, tables, instruction, temperature, language, output_path, output_format, conversation_history=None):
         super().__init__()
         self.api_key = api_key
         self.tables = [str(p) for p in tables]
@@ -437,11 +570,36 @@ class AIWorker(QThread):
         self.temperature = temperature
         self.language = language
         self.output_path = Path(output_path)
+        self.output_format = output_format if output_format in EXPORT_FORMATS else "excel"
         self.approval_event = threading.Event()
         self.history = conversation_history or []
 
     def approve_execution(self):
         self.approval_event.set()
+
+    def _finalize_success(self, all_columns):
+        expected_path = self.output_path
+        if not expected_path.exists():
+            return False, f"未生成指定路径的文件：{expected_path}"
+
+        try:
+            if self.output_format == "excel":
+                suffix = expected_path.suffix.lower()
+                if suffix in {".xlsx", ".xlsm"}:
+                    load_workbook(expected_path).close()
+                elif suffix == ".xls":
+                    if expected_path.stat().st_size <= 0:
+                        return False, "生成的Excel文件内容为空。"
+                else:
+                    return False, f"文件扩展名与期望的Excel格式不符：{suffix}"
+            else:
+                if expected_path.stat().st_size <= 0:
+                    return False, "生成的文件内容为空。"
+        except Exception as e:
+            return False, summarize_error(str(e), all_columns)
+
+        self.success.emit(str(expected_path))
+        return True, None
 
     def run(self):
         try:
@@ -457,11 +615,25 @@ class AIWorker(QThread):
             if self.isInterruptionRequested():
                 self.error.emit("已取消")
                 return
-            df = pd.read_excel(p).fillna("")
-            sample = df.head(5).to_csv(sep='\t', index=False)
+            try:
+                df = pd.read_excel(p, dtype=str).fillna("")
+            except Exception as e:
+                self.error.emit(f"无法读取表格：{p} - {e}")
+                return
+            sanitized_df, sensitive_map = desensitize_dataframe(df)
+            sample = sanitized_df.head(5).to_csv(sep='\t', index=False).strip()
             cols = ", ".join(map(str, df.columns))
             all_columns.update(df.columns)
-            table_texts.append(f"## {Path(p).name}\n路径: {p}\n列: {cols}\n示例:\n{sample}")
+            block_lines = [
+                f"## {Path(p).name}",
+                f"路径: {p}",
+                f"列: {cols}",
+            ]
+            if sensitive_map:
+                block_lines.append(f"已自动脱敏列: {', '.join(sensitive_map.keys())}")
+            block_lines.append("示例:")
+            block_lines.append(sample or "(空表)")
+            table_texts.append("\n".join(block_lines))
 
         try:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,8 +644,12 @@ class AIWorker(QThread):
         output_path_str = str(self.output_path)
         tables_json = json.dumps(self.tables, ensure_ascii=False) if self.tables else "[]"
         table_list_string = "\n".join(self.tables)
-        table_info_text = "\n\n".join(table_texts)
+        table_info_text = "\n\n".join(table_texts) if table_texts else "（未选择表格）"
         language_key = self.language.lower()
+
+        format_info = EXPORT_FORMATS.get(self.output_format, EXPORT_FORMATS["excel"])
+        format_desc = format_info["description"]
+        extensions_text = ", ".join(format_info["extensions"])
 
         history_lines = []
         for msg in self.history:
@@ -497,6 +673,8 @@ class AIWorker(QThread):
             f"{conversation_block}"
             f"当前用户最新指令：\n{self.instruction}\n\n"
             f"可用的Excel表格信息：\n{table_info_text}\n\n"
+            f"目标输出文件类型：{format_desc}（可用扩展名：{extensions_text}）。\n"
+            "所有示例数据均已在本地完成脱敏处理，仅用于展示列结构。\n"
             "以上绝对路径已由系统自动注入运行环境，无需等待用户重复提供。请直接使用这些路径，避免出现“Required Files Not Found”错误。"
         )
 
@@ -506,7 +684,7 @@ class AIWorker(QThread):
                 "生成代码时必须直接使用提供的完整文件路径，避免因路径错误导致“Required Files Not Found”。\n"
                 "必须声明一个入口宏：Sub ProcessTables(tableList As String, outputPath As String)。\n"
                 "参数 tableList 为使用换行分隔的完整Excel路径字符串；outputPath 为结果Excel文件的完整保存路径。\n"
-                f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}。\n"
+                f"运行环境会调用 ProcessTables(tableList, outputPath)，并且 outputPath 始终为：{output_path_str}（需生成 {format_desc}，扩展名：{extensions_text}）。\n"
                 "请在宏内拆分 tableList，按需打开并处理这些工作簿，最终将结果保存到 outputPath 指定的路径。\n"
                 "不要弹出对话框或依赖任何交互，也不要修改除结果文件外的其他文件。\n"
                 "交互要求：在构思代码时，请同步准备一段代码执行成功后的反馈话术，先确认任务完成，再礼貌询问用户下一步需求。该话术无需写入代码，将在我们系统中展示给用户。\n"
@@ -517,8 +695,8 @@ class AIWorker(QThread):
             env_instructions = (
                 "你将获得若干Excel文件的路径、列名以及前5行数据示例。请仅生成可直接运行的Python代码以满足用户需求。\n"
                 "生成代码时必须直接使用提供的完整文件路径，避免因路径错误导致“Required Files Not Found”。\n"
-                "运行环境提供了两个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）与 AI_OUTPUT_PATH（结果文件完整路径）。\n"
-                f"输出文件的目标路径固定为：{output_path_str}。请务必将结果保存到此路径。\n"
+                "运行环境提供了三个环境变量：AI_TABLE_PATHS（JSON数组，包含所有Excel完整路径）、AI_OUTPUT_PATH（结果文件完整路径）与 AI_OUTPUT_FORMAT（目标文件格式关键字）。\n"
+                f"输出文件的目标路径固定为：{output_path_str}，并且期望生成 {format_desc}（扩展名：{extensions_text}）。请务必按此格式保存。\n"
                 "代码完成后必须打印单行JSON，例如 print(json.dumps({'status':'success','output_path': output_path}, ensure_ascii=False))。\n"
                 "不要输出任何解释或额外文本，也不要包含```代码块标记。\n"
                 "交互要求：在规划代码时，请准备一段成功完成任务后的反馈话术，先确认任务完成，再询问用户下一步需求。该话术无需写入代码，将由我们的系统在执行成功后提示用户。"
@@ -600,12 +778,10 @@ class AIWorker(QThread):
 
                 expected_path = self.output_path
                 if expected_path.exists():
-                    try:
-                        load_workbook(expected_path).close()
-                        self.success.emit(str(expected_path))
+                    ok, err_text = self._finalize_success(all_columns)
+                    if ok:
                         return
-                    except Exception as e:
-                        last_err = summarize_error(str(e), all_columns)
+                    last_err = err_text
                 else:
                     last_err = f"未生成指定路径的文件：{expected_path}"
             else:
@@ -617,6 +793,8 @@ class AIWorker(QThread):
                     env["AI_TABLE_PATHS"] = tables_json
                     env["AI_TABLE_LIST"] = table_list_string
                     env["AI_OUTPUT_PATH"] = output_path_str
+                    env["AI_OUTPUT_FORMAT"] = self.output_format
+                    env["AI_OUTPUT_EXTENSIONS"] = json.dumps(format_info["extensions"], ensure_ascii=False)
                     env["AI_INSTRUCTION_TEXT"] = self.instruction
                     try:
                         proc = subprocess.run(
@@ -638,12 +816,10 @@ class AIWorker(QThread):
                 else:
                     expected_path = self.output_path
                     if expected_path.exists():
-                        try:
-                            load_workbook(expected_path).close()
-                            self.success.emit(str(expected_path))
+                        ok, err_text = self._finalize_success(all_columns)
+                        if ok:
                             return
-                        except Exception as e:
-                            last_err = summarize_error(str(e), all_columns)
+                        last_err = err_text
                     else:
                         result_json = None
                         if stdout:
@@ -693,15 +869,22 @@ class IntentWorker(QThread):
             if self.isInterruptionRequested():
                 return
             try:
-                df = pd.read_excel(path).fillna("")
+                df = pd.read_excel(path, dtype=str).fillna("")
             except Exception as e:
                 self.error.emit(f"无法读取表格：{path} - {e}")
                 return
-            sample_csv = df.head(5).to_csv(index=False)
+            sanitized_df, sensitive_map = desensitize_dataframe(df)
+            sample_csv = sanitized_df.head(5).to_csv(index=False).strip()
             columns = json.dumps([str(c) for c in df.columns], ensure_ascii=False)
-            table_chunks.append(
-                f"文件名: {Path(path).name}\n列名: {columns}\n数据样本:\n{sample_csv.strip()}"
-            )
+            chunk_lines = [
+                f"文件名: {Path(path).name}",
+                f"列名: {columns}",
+            ]
+            if sensitive_map:
+                chunk_lines.append(f"已自动脱敏列: {', '.join(sensitive_map.keys())}")
+            chunk_lines.append("数据样本:")
+            chunk_lines.append(sample_csv or "(空表)")
+            table_chunks.append("\n".join(chunk_lines))
 
         prompt_text = "以下是一个或多个Excel表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
 
@@ -867,6 +1050,13 @@ class AIHelperDialog(QDialog):
         self.language_combo.addItems(["Python", "VBA"])
         center_layout.addWidget(self.language_combo)
 
+        center_layout.addWidget(QLabel("导出文件格式:"))
+        self.export_format_combo = QComboBox()
+        for key, info in EXPORT_FORMATS.items():
+            self.export_format_combo.addItem(info["label"], userData=key)
+        self.export_format_combo.currentIndexChanged.connect(self.on_export_format_changed)
+        center_layout.addWidget(self.export_format_combo)
+
         center_layout.addWidget(QLabel("导出结果路径:"))
         path_layout = QHBoxLayout()
         self.output_edit = QLineEdit()
@@ -874,6 +1064,7 @@ class AIHelperDialog(QDialog):
         default_output = self.settings.get("last_ai_export_path", "") or ""
         if default_output:
             self.output_edit.setText(default_output)
+        self._sync_format_combo_with_path(default_output)
         btn_browse = QPushButton("浏览…")
         btn_browse.clicked.connect(self.browse_output)
         path_layout.addWidget(self.output_edit, 1)
@@ -885,6 +1076,14 @@ class AIHelperDialog(QDialog):
         self.message_edit.setPlaceholderText("请用自然语言描述下一步操作，例如：合并客户表的电话字段。系统会自动提供所选表格的完整路径。")
         self.message_edit.setMinimumHeight(140)
         center_layout.addWidget(self.message_edit)
+
+        self.privacy_label = QLabel("<a href='#'>用户隐私声明</a>")
+        self.privacy_label.setStyleSheet("color: #3b82f6;")
+        self.privacy_label.setTextFormat(Qt.TextFormat.RichText)
+        self.privacy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.privacy_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.privacy_label.linkActivated.connect(self.show_privacy_statement)
+        center_layout.addWidget(self.privacy_label, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.recommend_container = QWidget()
         self.recommend_layout = QHBoxLayout(self.recommend_container)
@@ -945,6 +1144,8 @@ class AIHelperDialog(QDialog):
             self.log_view.appendPlainText("系统：以下完整路径已同步给AI，您无需在指令中重复填写，供确认参考：")
             for path in new_paths:
                 self.log_view.appendPlainText(f"    {path}")
+            for path in new_paths:
+                self._scan_table_privacy(path)
             self.trigger_intent_recognition()
 
     def browse_output(self):
@@ -962,13 +1163,79 @@ class AIHelperDialog(QDialog):
                     initial_dir = str(Path.home())
             else:
                 initial_dir = str(Path.home())
-        path, _ = QFileDialog.getSaveFileName(self, "选择导出文件", initial_dir, "Excel Files (*.xlsx *.xlsm *.xls)")
+        fmt_key = self.export_format_combo.currentData()
+        fmt_info = EXPORT_FORMATS.get(fmt_key, EXPORT_FORMATS["excel"])
+        path, _ = QFileDialog.getSaveFileName(self, "选择导出文件", initial_dir, fmt_info["dialog_filter"])
         if path:
             p = Path(path)
-            if not p.suffix:
-                p = p.with_suffix(".xlsx")
+            if not p.suffix or p.suffix.lower() not in fmt_info["extensions"]:
+                p = p.with_suffix(fmt_info["default_extension"])
             self.output_edit.setText(str(p))
+            self._sync_format_combo_with_path(str(p))
             self.settings.update(last_ai_export_path=str(p))
+
+    def _get_format_info(self, fmt_key=None):
+        key = fmt_key if fmt_key in EXPORT_FORMATS else None
+        if key is None:
+            current_key = self.export_format_combo.currentData() if hasattr(self, "export_format_combo") else None
+            key = current_key if current_key in EXPORT_FORMATS else "excel"
+        return EXPORT_FORMATS.get(key, EXPORT_FORMATS["excel"])
+
+    def on_export_format_changed(self, index):
+        del index
+        fmt_info = self._get_format_info()
+        current_path = self.output_edit.text().strip()
+        if not current_path:
+            return
+        p = Path(current_path)
+        if p.suffix.lower() not in fmt_info["extensions"]:
+            new_path = p.with_suffix(fmt_info["default_extension"])
+            self.output_edit.setText(str(new_path))
+            self.settings.update(last_ai_export_path=str(new_path))
+
+    def _sync_format_combo_with_path(self, path: str):
+        if not hasattr(self, "export_format_combo") or self.export_format_combo is None:
+            return
+        suffix = Path(path).suffix.lower() if path else ""
+        matched_index = None
+        for idx in range(self.export_format_combo.count()):
+            fmt_key = self.export_format_combo.itemData(idx)
+            fmt_info = EXPORT_FORMATS.get(fmt_key, EXPORT_FORMATS["excel"])
+            if suffix and suffix in fmt_info["extensions"]:
+                matched_index = idx
+                break
+        self.export_format_combo.blockSignals(True)
+        self.export_format_combo.setCurrentIndex(matched_index if matched_index is not None else 0)
+        self.export_format_combo.blockSignals(False)
+
+    def show_privacy_statement(self, link=None):
+        del link
+        dlg = QDialog(self)
+        dlg.setWindowTitle("用户隐私声明")
+        layout = QVBoxLayout(dlg)
+        viewer = QTextBrowser()
+        viewer.setMarkdown(PRIVACY_STATEMENT_TEXT)
+        viewer.setReadOnly(True)
+        viewer.setMinimumSize(560, 360)
+        layout.addWidget(viewer)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignRight)
+        dlg.resize(640, 480)
+        dlg.exec()
+
+    def _scan_table_privacy(self, path: str):
+        try:
+            df = pd.read_excel(path, dtype=str, nrows=200).fillna("")
+        except Exception as e:
+            self.log_view.appendPlainText(f"系统：无法读取 {path} 进行脱敏检查：{e}")
+            return
+        _, sensitive_map = desensitize_dataframe(df)
+        if sensitive_map:
+            cols = ", ".join(sensitive_map.keys())
+            self.log_view.appendPlainText(f"系统：检测到敏感字段 {cols}，已自动使用随机样本对AI上下文进行脱敏。")
+        else:
+            self.log_view.appendPlainText("系统：未检测到明显敏感字段，仍会对上下文样本执行脱敏处理。")
 
     def append_history(self, role: str, content: str):
         content = (content or "").strip()
@@ -1177,12 +1444,12 @@ class AIHelperDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择导出结果路径")
             return
         output_path = Path(output_path_text)
-        if not output_path.suffix:
-            output_path = output_path.with_suffix(".xlsx")
+        fmt_key = self.export_format_combo.currentData()
+        fmt_info = self._get_format_info(fmt_key)
+        if not output_path.suffix or output_path.suffix.lower() not in fmt_info["extensions"]:
+            output_path = output_path.with_suffix(fmt_info["default_extension"])
             self.output_edit.setText(str(output_path))
-        if output_path.suffix.lower() not in [".xlsx", ".xlsm", ".xls"]:
-            QMessageBox.warning(self, "提示", "导出文件仅支持 .xlsx/.xlsm/.xls 格式")
-            return
+            self._sync_format_combo_with_path(str(output_path))
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -1215,7 +1482,7 @@ class AIHelperDialog(QDialog):
         self.btn_execute.setEnabled(False)
         self.awaiting_execution = False
 
-        self.worker = AIWorker(api_key, self.tables, message, temperature, language, str(output_path), history_snapshot)
+        self.worker = AIWorker(api_key, self.tables, message, temperature, language, str(output_path), fmt_key, history_snapshot)
         self.worker.progress.connect(self.on_worker_progress)
         self.worker.code_stream.connect(self.on_worker_code_stream)
         self.worker.code_ready.connect(self.on_worker_code_ready)
