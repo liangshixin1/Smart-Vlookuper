@@ -10,7 +10,7 @@ SMART-VLOOKUPER - Excel 字段匹配与 AI 自动化工具 (PyQt6)
 依赖：pip install pyqt6 pandas openpyxl pywin32 thefuzz
 """
 
-import sys, os, re, warnings, json, subprocess, tempfile, threading, random, string
+import sys, os, re, warnings, json, subprocess, tempfile, threading, random, string, io, textwrap
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
@@ -21,14 +21,15 @@ from PyQt6.QtWidgets import (
     QSpinBox, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QStyledItemDelegate, QRadioButton,
     QTabWidget, QDialog, QPlainTextEdit, QTextBrowser,
-    QDialogButtonBox
+    QDialogButtonBox, QStackedWidget, QFormLayout, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QAction, QTextCursor
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 import gc
 from thefuzz import fuzz
 from copy import copy
-from typing import List
+from typing import List, Optional
 
 # —— 静默 openpyxl 的数据验证扩展警告 ——
 warnings.filterwarnings(
@@ -45,6 +46,7 @@ class AppSettings:
 
     DEFAULTS = {
         "ai_api_key": "",
+        "report_api_key": "",
         "theme": "dark",
         "engine_mode": "auto",
         "last_ai_export_path": ""
@@ -987,12 +989,11 @@ def execute_vba_module(code: str, table_payload: str, output_path: Path):
         gc.collect()
 
 
-class AIHelperDialog(QDialog):
-    def __init__(self, parent, settings: AppSettings):
+class AIAssistantWidget(QWidget):
+    def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("AI助手")
-        self.resize(1200, 650)
         self.settings = settings
+        self.setMinimumSize(800, 600)
         self.tables = []
         self.conversation_messages = []
         self.worker = None
@@ -1589,6 +1590,11 @@ class SettingsDialog(QDialog):
         self.api_edit.setEchoMode(QLineEdit.EchoMode.Password)
         layout.addWidget(self.api_edit)
 
+        layout.addWidget(QLabel("数据报表模块 API Key:"))
+        self.report_api_edit = QLineEdit(self.settings.get("report_api_key", ""))
+        self.report_api_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.report_api_edit)
+
         layout.addWidget(QLabel("主题模式:"))
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["深色", "浅色"])
@@ -1614,6 +1620,7 @@ class SettingsDialog(QDialog):
         engine_mode = {0: "auto", 1: "com", 2: "openpyxl"}[self.engine_combo.currentIndex()]
         self.settings.update(
             ai_api_key=self.api_edit.text().strip(),
+            report_api_key=self.report_api_edit.text().strip(),
             theme=theme,
             engine_mode=engine_mode
         )
@@ -1685,26 +1692,20 @@ def openpyxl_write_and_save_optimized(tgt_path: Path, tgt_sheet: str, out_path: 
     
     return total_found, total_write
 
-# ===================== 主界面 =====================
+# ===================== 数据匹配模块 =====================
 
-class MapperUI(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.settings = AppSettings()
-        self.setWindowTitle("智能Vlookuper 1.1 -梁诗忻开发")
-        self.resize(1200, 820)
+class DataMatchingWidget(QWidget):
+    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.settings = settings
         # 多表模式下，源表和目标表都可能有多个，通过列表维护
         self.src_groups, self.tgt_groups = [], []
         self.src_headers, self.tgt_headers = [], []
         self.mode = "one2one"  # 默认一对一
         self._init_ui()
-        self._create_menus()
-        self._init_ai_button()
-        self._apply_style()
 
     def _init_ui(self):
-        central = QWidget()
-        layout = QGridLayout(central)
+        layout = QGridLayout(self)
         layout.setContentsMargins(14, 12, 14, 12); layout.setSpacing(12)
 
         # ------ 模式选择 ------
@@ -1770,34 +1771,6 @@ class MapperUI(QMainWindow):
         self.btn_auto.clicked.connect(self.auto_fill_mapping)
         self.btn_run.clicked.connect(self.run_and_export)
         self.on_mode_change()
-        self.setCentralWidget(central)
-
-    def _create_menus(self):
-        bar = self.menuBar()
-        settings_menu = bar.addMenu("设置")
-        action_prefs = QAction("首选项...", self)
-        action_prefs.triggered.connect(self.open_settings_dialog)
-        settings_menu.addAction(action_prefs)
-
-        about_menu = bar.addMenu("关于")
-        action_about = QAction("关于 SMART VLOOKUPER", self)
-        action_about.triggered.connect(self.show_about_dialog)
-        about_menu.addAction(action_about)
-
-    def _update_ai_button_style(self):
-        if not hasattr(self, "btn_ai"):
-            return
-        if self.settings.get("theme", "dark") == "dark":
-            style = (
-                "QPushButton {background:#f97316; color:white; border:none; border-radius:24px;}"
-                "QPushButton:hover {background:#ea580c;}"
-            )
-        else:
-            style = (
-                "QPushButton {background:#fb923c; color:#1f2937; border:none; border-radius:24px;}"
-                "QPushButton:hover {background:#f97316;}"
-            )
-        self.btn_ai.setStyleSheet(style)
 
     # ---- 动态增减源/目标组 ----
     def add_source_group(self):
@@ -2169,52 +2142,913 @@ class MapperUI(QMainWindow):
             msg = "\n\n".join([f"{p}: 命中{f} 写入{w}" for p, _, f, w in results])
             QMessageBox.information(self, "完成", f"已处理{len(results)}个目标表：\n\n{msg}")
 
-    def _init_ai_button(self):
-        self.btn_ai = QPushButton("AI", self)
-        self.btn_ai.setFixedSize(48, 48)
-        self._update_ai_button_style()
-        self.btn_ai.clicked.connect(self.show_ai_dialog)
-        self._position_ai_button()
 
-    def _position_ai_button(self):
-        x = self.width() - self.btn_ai.width() - 20
-        y = self.height() - self.btn_ai.height() - 20
-        self.btn_ai.move(x, y)
+# ===================== 数据报表与清洗模块 =====================
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, 'btn_ai'):
-            self._position_ai_button()
 
-    def show_ai_dialog(self):
-        dlg = AIHelperDialog(self, self.settings)
-        dlg.exec()
+class ReportGenerationWorker(QThread):
+    progress = pyqtSignal(str)
+    error = pyqtSignal(str)
+    success = pyqtSignal(str)
 
-    def _apply_style(self):
+    def __init__(self, api_key: str, sample_csv: str, columns: List[str], instruction: str, dataframe: pd.DataFrame):
+        super().__init__()
+        self.api_key = api_key.strip()
+        self.sample_csv = sample_csv
+        self.columns = columns
+        self.instruction = instruction.strip()
+        self.dataframe = dataframe
+
+    def _prepare_prompt(self) -> tuple[str, str]:
+        column_text = ", ".join(map(str, self.columns)) or "(无列信息)"
+        preview_text = self.sample_csv.strip() or "(空表)"
+        rows, cols = self.dataframe.shape
+        system_prompt = textwrap.dedent(
+            """
+            你是一位资深数据分析师，需要基于提供的结构化数据生成可视化分析报告。
+            请严格编写可直接运行的 Python 脚本：
+            1. 使用 pandas 读取环境变量 REPORT_CSV_PATH 指向的 UTF-8 CSV 数据文件。
+            2. 优先使用 pyecharts 生成交互式图表；如环境不可用，可退回 matplotlib 并将图片转为 Base64 内嵌至 HTML。
+            3. 生成包含标题、摘要、洞察段落和图表的完整 HTML 字符串，并通过 print(html_string) 输出。
+            4. 禁止写入除标准输出外的任何文件，也不要尝试联网或安装依赖。
+            5. 代码必须自包含，包含必要的 import 与数据处理逻辑。
+            """
+        ).strip()
+        user_prompt = textwrap.dedent(
+            f"""
+            [数据结构]
+            列: {column_text}
+            总记录数: {rows} 行，{cols} 列
+
+            [脱敏样本CSV]
+            {preview_text}
+
+            [分析需求]
+            {self.instruction or '请给出全面的数据洞察、关键指标与图表建议。'}
+
+            请按照以上约束生成 Python 代码，确保最终仅打印 HTML 字符串。
+            """
+        ).strip()
+        return system_prompt, user_prompt
+
+    def run(self):
+        if not self.api_key:
+            self.error.emit("未配置数据报表模块 API Key")
+            return
+
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            self.error.emit(f"未安装openai库: {e}")
+            return
+
+        system_prompt, user_prompt = self._prepare_prompt()
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+
+        self.progress.emit("正在调用模型生成报告代码…")
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception as e:
+            self.error.emit(str(e))
+            return
+
+        content = ""
+        try:
+            content = (response.choices[0].message.content or "").strip()
+        except Exception:
+            self.error.emit("模型返回内容为空")
+            return
+
+        if content.startswith("```"):
+            parts = content.splitlines()
+            content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
+
+        code = content.strip()
+        if not code:
+            self.error.emit("未获取到有效的代码内容")
+            return
+
+        self.progress.emit("正在执行生成的分析脚本…")
+        with tempfile.TemporaryDirectory() as td:
+            data_path = Path(td) / "dataset.csv"
+            try:
+                self.dataframe.to_csv(data_path, index=False, encoding="utf-8")
+            except Exception as e:
+                self.error.emit(f"写入临时数据失败：{e}")
+                return
+
+            script_path = Path(td) / "report.py"
+            try:
+                script_path.write_text(code, encoding="utf-8")
+            except Exception as e:
+                self.error.emit(f"写入生成脚本失败：{e}")
+                return
+
+            env = os.environ.copy()
+            env.setdefault("PYTHONPATH", env.get("PYTHONPATH", ""))
+            env["REPORT_CSV_PATH"] = str(data_path)
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    cwd=td,
+                    env=env,
+                    timeout=180,
+                )
+            except Exception as e:
+                self.error.emit(f"执行脚本失败：{e}")
+                return
+
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        if proc.returncode != 0:
+            err_text = stderr or stdout or "未知错误"
+            self.error.emit(f"脚本执行失败：{err_text}")
+            return
+
+        if not stdout:
+            self.error.emit("脚本执行成功但未返回HTML内容")
+            return
+
+        self.success.emit(stdout)
+
+
+class ScraperWorker(QThread):
+    progress = pyqtSignal(str)
+    error = pyqtSignal(str)
+    data_ready = pyqtSignal(object, str)
+
+    def __init__(self, api_key: str, url: str, instruction: str):
+        super().__init__()
+        self.api_key = api_key.strip()
+        self.url = url.strip()
+        self.instruction = instruction.strip()
+
+    def run(self):
+        if not self.api_key:
+            self.error.emit("未配置数据报表模块 API Key")
+            return
+        if not self.url:
+            self.error.emit("请输入有效的网址")
+            return
+        if not self.instruction:
+            self.error.emit("请输入爬取需求")
+            return
+
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            self.error.emit(f"未安装openai库: {e}")
+            return
+
+        system_prompt = textwrap.dedent(
+            """
+            你是一名善于编写可靠网络爬虫的工程师。
+            根据用户指令生成 Python 脚本：
+            1. 通过环境变量 SCRAPER_TARGET_URL 获取目标网页。
+            2. 使用 requests、BeautifulSoup4、pandas.read_html 或 json 解析等方式采集数据。
+            3. 将结果保存为 UTF-8 CSV 文件，路径由环境变量 SCRAPER_OUTPUT_PATH 提供。
+            4. 不要进行无限循环、安装依赖或执行与任务无关的操作。
+            5. 脚本完成后不得输出除必要日志外的内容。
+            """
+        ).strip()
+        user_prompt = textwrap.dedent(
+            f"""
+            目标网址: {self.url}
+            爬取需求: {self.instruction}
+
+            请生成满足要求的 Python 脚本。
+            """
+        ).strip()
+
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+
+        self.progress.emit("正在生成爬虫脚本…")
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception as e:
+            self.error.emit(str(e))
+            return
+
+        content = ""
+        try:
+            content = (response.choices[0].message.content or "").strip()
+        except Exception:
+            self.error.emit("模型返回内容为空")
+            return
+
+        if content.startswith("```"):
+            parts = content.splitlines()
+            content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
+
+        code = content.strip()
+        if not code:
+            self.error.emit("未获取到有效的爬虫代码")
+            return
+
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "scraped.csv"
+            script_path = Path(td) / "scraper.py"
+            try:
+                script_path.write_text(code, encoding="utf-8")
+            except Exception as e:
+                self.error.emit(f"写入脚本失败：{e}")
+                return
+
+            env = os.environ.copy()
+            env.setdefault("PYTHONPATH", env.get("PYTHONPATH", ""))
+            env["SCRAPER_TARGET_URL"] = self.url
+            env["SCRAPER_OUTPUT_PATH"] = str(output_path)
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            self.progress.emit("正在执行爬虫脚本…")
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                    cwd=td,
+                    env=env,
+                    timeout=180,
+                )
+            except Exception as e:
+                self.error.emit(f"执行爬虫失败：{e}")
+                return
+
+            stdout = proc.stdout.strip()
+            stderr = proc.stderr.strip()
+            if proc.returncode != 0:
+                err_text = stderr or stdout or "未知错误"
+                self.error.emit(f"爬虫脚本执行失败：{err_text}")
+                return
+
+            if not output_path.exists():
+                self.error.emit("爬虫脚本未生成任何数据文件")
+                return
+
+            try:
+                df = pd.read_csv(output_path)
+            except Exception as e:
+                self.error.emit(f"读取爬取结果失败：{e}")
+                return
+
+        self.data_ready.emit(df, self.url)
+
+
+class ScraperDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("从网页获取数据")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("目标网址:"))
+        self.url_edit = QLineEdit()
+        layout.addWidget(self.url_edit)
+        layout.addWidget(QLabel("爬取需求描述:"))
+        self.instruction_edit = QPlainTextEdit()
+        self.instruction_edit.setPlaceholderText("例如：抓取此页面的商品列表与价格，并保存为csv。")
+        self.instruction_edit.setMinimumHeight(120)
+        layout.addWidget(self.instruction_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "提示", "请输入有效的网址")
+            return
+        instruction = self.instruction_edit.toPlainText().strip()
+        if not instruction:
+            QMessageBox.warning(self, "提示", "请输入爬取需求")
+            return
+        self.accept()
+
+    def get_values(self) -> tuple[str, str]:
+        return self.url_edit.text().strip(), self.instruction_edit.toPlainText().strip()
+
+
+class DataReporterWidget(QWidget):
+    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.settings = settings
+        self.current_df: Optional[pd.DataFrame] = None
+        self.sanitized_df: Optional[pd.DataFrame] = None
+        self.current_source: str = ""
+        self.report_worker: Optional[ReportGenerationWorker] = None
+        self.scraper_worker: Optional[ScraperWorker] = None
+        self.setAcceptDrops(True)
+        self._build_ui()
+
+    def _build_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
+
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setSpacing(10)
+
+        source_group = QGroupBox("数据源")
+        source_layout = QVBoxLayout(source_group)
+        btn_row = QHBoxLayout()
+        self.btn_select_file = QPushButton("选择本地文件…")
+        self.btn_select_file.clicked.connect(self.select_file)
+        btn_row.addWidget(self.btn_select_file)
+        self.btn_scrape = QPushButton("从网页获取数据")
+        self.btn_scrape.clicked.connect(self.fetch_from_web)
+        btn_row.addWidget(self.btn_scrape)
+        source_layout.addLayout(btn_row)
+        self.source_label = QLabel("未选择数据源")
+        self.source_label.setWordWrap(True)
+        source_layout.addWidget(self.source_label)
+        self.summary_label = QLabel("")
+        source_layout.addWidget(self.summary_label)
+        left_layout.addWidget(source_group)
+
+        preview_group = QGroupBox("数据预览")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_table = QTableWidget()
+        self.preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.preview_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.preview_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.preview_table.horizontalHeader().setStretchLastSection(True)
+        preview_layout.addWidget(self.preview_table)
+        left_layout.addWidget(preview_group, 1)
+
+        instruction_group = QGroupBox("分析需求")
+        instruction_layout = QVBoxLayout(instruction_group)
+        self.instruction_edit = QPlainTextEdit()
+        self.instruction_edit.setPlaceholderText("例如：分析各产品销售额占比，并给出关键洞察。")
+        self.instruction_edit.setMinimumHeight(120)
+        instruction_layout.addWidget(self.instruction_edit)
+        self.btn_generate = QPushButton("生成报告")
+        self.btn_generate.clicked.connect(self.generate_report)
+        instruction_layout.addWidget(self.btn_generate)
+        self.status_label = QLabel("请先选择数据源")
+        instruction_layout.addWidget(self.status_label)
+        left_layout.addWidget(instruction_group)
+
+        left_layout.addStretch()
+
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        report_group = QGroupBox("报告预览")
+        report_layout = QVBoxLayout(report_group)
+        self.report_view = QWebEngineView()
+        self.report_view.setHtml("<h3 style='color:#94a3b8;'>生成的报告将在此显示</h3>")
+        report_layout.addWidget(self.report_view)
+        right_layout.addWidget(report_group, 1)
+
+        main_layout.addWidget(left_container, 1)
+        main_layout.addWidget(right_container, 1)
+
+    # ---- 数据加载与预览 ----
+    def select_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择数据文件",
+            "",
+            "数据文件 (*.xlsx *.xlsm *.xls *.csv)"
+        )
+        if path:
+            self._load_file(Path(path))
+
+    def fetch_from_web(self):
+        if self.scraper_worker and self.scraper_worker.isRunning():
+            QMessageBox.information(self, "请稍候", "当前正在执行爬虫任务，请等待完成。")
+            return
+        dlg = ScraperDialog(self)
+        if dlg.exec():
+            url, instruction = dlg.get_values()
+            api_key = (self.settings.get("report_api_key", "") or "").strip()
+            worker = ScraperWorker(api_key, url, instruction)
+            worker.progress.connect(self._set_status)
+            worker.error.connect(self._handle_scraper_error)
+            worker.data_ready.connect(self._handle_scraper_success)
+            worker.finished.connect(self._scraper_finished)
+            self.scraper_worker = worker
+            self._set_status("正在启动智能爬虫…")
+            worker.start()
+
+    def _scraper_finished(self):
+        self.scraper_worker = None
+
+    def _handle_scraper_error(self, message: str):
+        self.scraper_worker = None
+        QMessageBox.critical(self, "爬虫错误", message)
+        self._set_status("爬虫执行失败")
+
+    def _handle_scraper_success(self, df: pd.DataFrame, url: str):
+        self.scraper_worker = None
+        self._adopt_dataframe(df, f"来自网页数据：{url}")
+        self._set_status("已加载爬取数据，请输入分析需求。")
+
+    def _load_file(self, path: Path):
+        try:
+            if path.suffix.lower() == ".csv":
+                df = pd.read_csv(path)
+            else:
+                df = pd.read_excel(path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
+            return
+
+        self._adopt_dataframe(df, f"本地文件：{path.name}")
+        self._set_status("已加载本地数据，请输入分析需求。")
+
+    def _adopt_dataframe(self, df: pd.DataFrame, source_desc: str):
+        self.current_df = df.copy()
+        self.sanitized_df, _ = desensitize_dataframe(df)
+        self.current_source = source_desc
+        self.source_label.setText(source_desc)
+        rows, cols = df.shape
+        self.summary_label.setText(f"记录数：{rows} 行 × {cols} 列")
+        self._populate_preview(df)
+        self.report_view.setHtml("<h3 style='color:#94a3b8;'>请生成新的报告</h3>")
+
+    def _populate_preview(self, df: pd.DataFrame):
+        if df is None:
+            self.preview_table.clear()
+            self.preview_table.setRowCount(0)
+            self.preview_table.setColumnCount(0)
+            return
+
+        preview = df.head(200)
+        self.preview_table.setRowCount(len(preview.index))
+        self.preview_table.setColumnCount(len(preview.columns))
+        self.preview_table.setHorizontalHeaderLabels([str(c) for c in preview.columns])
+        for r, (_, row) in enumerate(preview.iterrows()):
+            for c, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                self.preview_table.setItem(r, c, item)
+        self.preview_table.resizeColumnsToContents()
+
+    # ---- 报告生成 ----
+    def generate_report(self):
+        if self.report_worker and self.report_worker.isRunning():
+            QMessageBox.information(self, "请稍候", "当前已有生成任务在执行，请稍候完成。")
+            return
+        if self.current_df is None or self.sanitized_df is None:
+            QMessageBox.warning(self, "提示", "请先选择或获取数据。")
+            return
+
+        instruction = self.instruction_edit.toPlainText().strip()
+        if not instruction:
+            QMessageBox.warning(self, "提示", "请输入报告需求。")
+            return
+
+        api_key = (self.settings.get("report_api_key", "") or "").strip()
+        if not api_key:
+            QMessageBox.warning(self, "提示", "请先在设置中配置数据报表模块的 API Key。")
+            return
+
+        sample_csv = self.sanitized_df.head(20).to_csv(index=False)
+        worker = ReportGenerationWorker(api_key, sample_csv, list(self.current_df.columns), instruction, self.current_df.copy())
+        worker.progress.connect(self._set_status)
+        worker.error.connect(self._handle_report_error)
+        worker.success.connect(self._handle_report_success)
+        worker.finished.connect(self._report_finished)
+        self.report_worker = worker
+        self.btn_generate.setEnabled(False)
+        self._set_status("正在生成数据报告…")
+        worker.start()
+
+    def _handle_report_success(self, html: str):
+        self.report_view.setHtml(html)
+        self._set_status("报告生成完成")
+
+    def _handle_report_error(self, message: str):
+        QMessageBox.critical(self, "生成失败", message)
+        self._set_status("报告生成失败")
+
+    def _report_finished(self):
+        self.btn_generate.setEnabled(True)
+        self.report_worker = None
+
+    def _set_status(self, text: str):
+        self.status_label.setText(text)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            local_path = url.toLocalFile()
+            if local_path:
+                self._load_file(Path(local_path))
+                break
+        event.acceptProposedAction()
+        super().dropEvent(event)
+
+
+class DataCleanerWidget(QWidget):
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.current_df: Optional[pd.DataFrame] = None
+        self.current_path: Optional[Path] = None
+        self._build_ui()
+
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        self.btn_open = QPushButton("加载数据…")
+        self.btn_open.clicked.connect(self.open_file)
+        top_row.addWidget(self.btn_open)
+        self.btn_export = QPushButton("导出清洗结果")
+        self.btn_export.clicked.connect(self.export_file)
+        top_row.addWidget(self.btn_export)
+        top_row.addStretch()
+        main_layout.addLayout(top_row)
+
+        splitter = QSplitter()
+        splitter.setOrientation(Qt.Orientation.Horizontal)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        self.path_label = QLabel("未加载数据")
+        self.path_label.setWordWrap(True)
+        left_layout.addWidget(self.path_label)
+        self.clean_preview = QTableWidget()
+        self.clean_preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.clean_preview.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.clean_preview.horizontalHeader().setStretchLastSection(True)
+        left_layout.addWidget(self.clean_preview, 1)
+        self.status_label = QLabel("请选择数据并执行清洗操作。")
+        left_layout.addWidget(self.status_label)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+
+        self._build_dedup_section(right_layout)
+        self._build_null_section(right_layout)
+        self._build_text_section(right_layout)
+        self._build_convert_section(right_layout)
+        right_layout.addStretch()
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([700, 400])
+        main_layout.addWidget(splitter, 1)
+
+    def _build_dedup_section(self, layout: QVBoxLayout):
+        group = QGroupBox("去重")
+        group_layout = QFormLayout(group)
+        self.dedup_cols_edit = QLineEdit()
+        self.dedup_cols_edit.setPlaceholderText("留空表示按所有列去重；多个列名用逗号分隔")
+        group_layout.addRow("列名称:", self.dedup_cols_edit)
+        btn = QPushButton("执行去重")
+        btn.clicked.connect(self.apply_dedup)
+        group_layout.addRow(btn)
+        layout.addWidget(group)
+
+    def _build_null_section(self, layout: QVBoxLayout):
+        group = QGroupBox("空值处理")
+        form = QFormLayout(group)
+        self.dropna_cols_edit = QLineEdit()
+        self.dropna_cols_edit.setPlaceholderText("留空表示删除任何包含空值的行")
+        btn_drop = QPushButton("删除空值行")
+        btn_drop.clicked.connect(self.apply_dropna)
+        form.addRow("列名称:", self.dropna_cols_edit)
+        form.addRow(btn_drop)
+
+        self.fillna_cols_edit = QLineEdit()
+        self.fillna_cols_edit.setPlaceholderText("多个列名用逗号分隔，留空表示全部列")
+        form.addRow("填充列:", self.fillna_cols_edit)
+        self.fillna_method_combo = QComboBox()
+        self.fillna_method_combo.addItem("使用指定文本", "custom")
+        self.fillna_method_combo.addItem("填充为0", "zero")
+        self.fillna_method_combo.addItem("填充列平均值", "mean")
+        self.fillna_method_combo.addItem("填充列中位数", "median")
+        self.fillna_method_combo.addItem("填充列众数", "mode")
+        form.addRow("填充方式:", self.fillna_method_combo)
+        self.fillna_value_edit = QLineEdit()
+        self.fillna_value_edit.setPlaceholderText("当选择指定文本时填写此处")
+        form.addRow("填充值:", self.fillna_value_edit)
+        btn_fill = QPushButton("填充空值")
+        btn_fill.clicked.connect(self.apply_fillna)
+        form.addRow(btn_fill)
+        layout.addWidget(group)
+
+    def _build_text_section(self, layout: QVBoxLayout):
+        group = QGroupBox("文本处理")
+        form = QFormLayout(group)
+        self.trim_cols_edit = QLineEdit()
+        self.trim_cols_edit.setPlaceholderText("多个列名用逗号分隔，留空表示所有字符串列")
+        form.addRow("去除首尾空格:", self.trim_cols_edit)
+        btn = QPushButton("执行修剪")
+        btn.clicked.connect(self.apply_trim)
+        form.addRow(btn)
+        layout.addWidget(group)
+
+    def _build_convert_section(self, layout: QVBoxLayout):
+        group = QGroupBox("格式转换")
+        form = QFormLayout(group)
+        self.convert_col_edit = QLineEdit()
+        form.addRow("目标列:", self.convert_col_edit)
+        self.convert_type_combo = QComboBox()
+        self.convert_type_combo.addItem("文本", "str")
+        self.convert_type_combo.addItem("整数", "int")
+        self.convert_type_combo.addItem("浮点数", "float")
+        form.addRow("目标类型:", self.convert_type_combo)
+        btn = QPushButton("转换类型")
+        btn.clicked.connect(self.apply_convert)
+        form.addRow(btn)
+        layout.addWidget(group)
+
+    # ---- 数据加载与导出 ----
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择数据文件",
+            "",
+            "数据文件 (*.xlsx *.xlsm *.xls *.csv)"
+        )
+        if path:
+            try:
+                if path.lower().endswith(".csv"):
+                    df = pd.read_csv(path)
+                else:
+                    df = pd.read_excel(path)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
+                return
+            self.current_df = df
+            self.current_path = Path(path)
+            self.path_label.setText(f"当前文件：{Path(path).name}")
+            self._refresh_preview()
+            self._set_status("数据已加载，可选择清洗操作。")
+
+    def export_file(self):
+        if self.current_df is None:
+            QMessageBox.warning(self, "提示", "请先加载并处理数据。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出结果",
+            "",
+            "Excel 文件 (*.xlsx)"
+        )
+        if not path:
+            return
+        try:
+            self.current_df.to_excel(path, index=False)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败：{e}")
+            return
+        self._set_status(f"已导出至：{path}")
+
+    # ---- 操作实现 ----
+    def _parse_columns(self, text: str) -> Optional[List[str]]:
+        cols = [c.strip() for c in text.split(",") if c.strip()]
+        return cols if cols else None
+
+    def _ensure_dataframe(self) -> bool:
+        if self.current_df is None:
+            QMessageBox.warning(self, "提示", "请先加载数据。")
+            return False
+        return True
+
+    def apply_dedup(self):
+        if not self._ensure_dataframe():
+            return
+        cols = self._parse_columns(self.dedup_cols_edit.text())
+        try:
+            if cols:
+                missing = [c for c in cols if c not in self.current_df.columns]
+                if missing:
+                    QMessageBox.warning(self, "提示", f"以下列不存在：{missing}")
+                    return
+                self.current_df = self.current_df.drop_duplicates(subset=cols)
+            else:
+                self.current_df = self.current_df.drop_duplicates()
+            self._refresh_preview()
+            self._set_status("已完成去重处理。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"去重失败：{e}")
+
+    def apply_dropna(self):
+        if not self._ensure_dataframe():
+            return
+        cols = self._parse_columns(self.dropna_cols_edit.text())
+        try:
+            if cols:
+                missing = [c for c in cols if c not in self.current_df.columns]
+                if missing:
+                    QMessageBox.warning(self, "提示", f"以下列不存在：{missing}")
+                    return
+                self.current_df = self.current_df.dropna(subset=cols)
+            else:
+                self.current_df = self.current_df.dropna()
+            self._refresh_preview()
+            self._set_status("已删除包含空值的行。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"删除空值失败：{e}")
+
+    def apply_fillna(self):
+        if not self._ensure_dataframe():
+            return
+        cols = self._parse_columns(self.fillna_cols_edit.text())
+        target_cols = cols if cols else list(self.current_df.columns)
+        missing = [c for c in target_cols if c not in self.current_df.columns]
+        if missing:
+            QMessageBox.warning(self, "提示", f"以下列不存在：{missing}")
+            return
+
+        method = self.fillna_method_combo.currentData()
+        try:
+            if method == "custom":
+                value = self.fillna_value_edit.text()
+                self.current_df[target_cols] = self.current_df[target_cols].fillna(value)
+            elif method == "zero":
+                self.current_df[target_cols] = self.current_df[target_cols].fillna(0)
+            else:
+                for col in target_cols:
+                    series = self.current_df[col]
+                    numeric = pd.to_numeric(series, errors="coerce")
+                    if method == "mean":
+                        fill_value = numeric.mean()
+                    elif method == "median":
+                        fill_value = numeric.median()
+                    else:
+                        fill_value = series.mode().iloc[0] if not series.mode().empty else ""
+                    self.current_df[col] = series.fillna(fill_value)
+            self._refresh_preview()
+            self._set_status("已完成空值填充。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"填充失败：{e}")
+
+    def apply_trim(self):
+        if not self._ensure_dataframe():
+            return
+        cols = self._parse_columns(self.trim_cols_edit.text())
+        target_cols = cols if cols else [c for c in self.current_df.columns if self.current_df[c].dtype == object]
+        missing = [c for c in target_cols if c not in self.current_df.columns]
+        if missing:
+            QMessageBox.warning(self, "提示", f"以下列不存在：{missing}")
+            return
+        try:
+            for col in target_cols:
+                self.current_df[col] = self.current_df[col].astype(str).str.strip()
+            self._refresh_preview()
+            self._set_status("已完成文本修剪。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"文本修剪失败：{e}")
+
+    def apply_convert(self):
+        if not self._ensure_dataframe():
+            return
+        col = self.convert_col_edit.text().strip()
+        if not col:
+            QMessageBox.warning(self, "提示", "请填写需要转换的列名。")
+            return
+        if col not in self.current_df.columns:
+            QMessageBox.warning(self, "提示", f"列 {col} 不存在。")
+            return
+        target_type = self.convert_type_combo.currentData()
+        try:
+            if target_type == "str":
+                self.current_df[col] = self.current_df[col].astype(str)
+            elif target_type == "int":
+                self.current_df[col] = pd.to_numeric(self.current_df[col], errors="coerce").astype("Int64")
+            else:
+                self.current_df[col] = pd.to_numeric(self.current_df[col], errors="coerce").astype(float)
+            self._refresh_preview()
+            self._set_status("已完成格式转换。")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"转换失败：{e}")
+
+    # ---- UI 辅助 ----
+    def _refresh_preview(self):
+        if self.current_df is None:
+            self.clean_preview.clear()
+            self.clean_preview.setRowCount(0)
+            self.clean_preview.setColumnCount(0)
+            return
+        preview = self.current_df.head(200)
+        self.clean_preview.setRowCount(len(preview.index))
+        self.clean_preview.setColumnCount(len(preview.columns))
+        self.clean_preview.setHorizontalHeaderLabels([str(c) for c in preview.columns])
+        for r, (_, row) in enumerate(preview.iterrows()):
+            for c, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                self.clean_preview.setItem(r, c, item)
+        self.clean_preview.resizeColumnsToContents()
+
+    def _set_status(self, text: str):
+        self.status_label.setText(text)
+
+
+# ===================== 主窗口 =====================
+
+
+class SmartVlookuperMainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.settings = AppSettings()
+        self.setWindowTitle("诗忻智能Excel数据伴侣 v2.0")
+        self.resize(1400, 900)
+        self._build_ui()
+        self._create_menus()
+        self.apply_theme()
+
+    def _build_ui(self):
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.nav_list = QListWidget()
+        self.nav_list.setFixedWidth(200)
+        self.nav_list.setSpacing(2)
+        self.nav_list.addItem(QListWidgetItem("数据匹配"))
+        self.nav_list.addItem(QListWidgetItem("数据报表"))
+        self.nav_list.addItem(QListWidgetItem("数据清洗"))
+        self.nav_list.addItem(QListWidgetItem("AI 助手"))
+        layout.addWidget(self.nav_list)
+
+        self.stack = QStackedWidget()
+        self.data_matching = DataMatchingWidget(self.settings, self)
+        self.data_reporter = DataReporterWidget(self.settings, self)
+        self.data_cleaner = DataCleanerWidget(self)
+        self.ai_widget = AIAssistantWidget(self.settings, self)
+        self.stack.addWidget(self.data_matching)
+        self.stack.addWidget(self.data_reporter)
+        self.stack.addWidget(self.data_cleaner)
+        self.stack.addWidget(self.ai_widget)
+        layout.addWidget(self.stack, 1)
+
+        self.nav_list.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav_list.setCurrentRow(0)
+
+        self.setCentralWidget(central)
+
+    def _create_menus(self):
+        menu_settings = self.menuBar().addMenu("设置")
+        action_prefs = QAction("首选项…", self)
+        action_prefs.triggered.connect(self.open_settings_dialog)
+        menu_settings.addAction(action_prefs)
+
+        menu_about = self.menuBar().addMenu("关于")
+        action_about = QAction("关于本应用", self)
+        action_about.triggered.connect(self.show_about_dialog)
+        menu_about.addAction(action_about)
+
+    def apply_theme(self):
         theme = self.settings.get("theme", "dark")
         style = DARK_STYLESHEET if theme == "dark" else LIGHT_STYLESHEET
         app = QApplication.instance()
         if app:
             app.setStyleSheet(style)
-        self._update_ai_button_style()
 
     def open_settings_dialog(self):
         dlg = SettingsDialog(self, self.settings)
         if dlg.exec():
-            self._apply_style()
+            self.apply_theme()
 
     def show_about_dialog(self):
         QMessageBox.information(
             self,
             "关于",
-            "SMART VLOOKUPER 1.1\n©梁诗忻 2025. 本项目采用MIT许可证。\n项目地址：https://github.com/liangshixin1/Smart-Vlookuper"
+            "诗忻智能Excel数据伴侣 v2.0\n© 梁诗忻 2025. 本项目采用 MIT 许可证。\n项目地址：https://github.com/liangshixin1/Smart-Vlookuper"
         )
+
 
 def main():
     app = QApplication(sys.argv)
-    w = MapperUI()
+    w = SmartVlookuperMainWindow()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
