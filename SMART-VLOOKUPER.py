@@ -115,6 +115,44 @@ EXPORT_FORMATS = {
     }
 }
 
+
+CODE_CHAR_NORMALIZATION = str.maketrans({
+    "：": ":",
+    "；": ";",
+    "，": ",",
+    "。": ".",
+    "、": ",",
+    "（": "(",
+    "）": ")",
+    "【": "[",
+    "】": "]",
+    "［": "[",
+    "］": "]",
+    "｛": "{",
+    "｝": "}",
+    "《": "<",
+    "》": ">",
+    "「": '"',
+    "」": '"',
+    "“": '"',
+    "”": '"',
+    "‘": "'",
+    "’": "'",
+    " ": " ",
+    " ": " ",
+    "　": " ",
+})
+
+
+def normalize_generated_code(code: str) -> str:
+    """将常见的全角标点替换为Python可识别的半角符号"""
+    if not code:
+        return ""
+    normalized = code.translate(CODE_CHAR_NORMALIZATION)
+    normalized = normalized.replace("\r\n", "\n").replace("\ufeff", "")
+    return normalized
+
+
 PRIVACY_STATEMENT_TEXT = """最后更新日期：2025年9月26日
 
 尊敬的用户：
@@ -797,7 +835,7 @@ class AIWorker(QThread):
         base_prompt = env_instructions + "\n\n" + task_block
 
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
         attempt, last_err, last_code = 0, None, ""
         while attempt < 3:
             if self.isInterruptionRequested():
@@ -1047,7 +1085,7 @@ class IntentWorker(QThread):
 
         prompt_text = "以下是一个或多个表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
         try:
             response = client.chat.completions.create(
                 model="deepseek-chat",
@@ -2306,7 +2344,8 @@ class DataMatchingWidget(QWidget):
 class ReportGenerationWorker(QThread):
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
-    success = pyqtSignal(str)
+    success = pyqtSignal(str, str)
+    code_ready = pyqtSignal(str)
 
     def __init__(self, api_key: str, sample_csv: str, columns: List[str], instruction: str, dataframe: pd.DataFrame):
         super().__init__()
@@ -2365,7 +2404,7 @@ class ReportGenerationWorker(QThread):
             return
 
         system_prompt, user_prompt = self._prepare_prompt()
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2389,6 +2428,7 @@ class ReportGenerationWorker(QThread):
             env["PYTHONIOENCODING"] = "utf-8"
 
             script_path = Path(td) / "report.py"
+            latest_code = ""
 
             for attempt in range(max_attempts):
                 if attempt == 0:
@@ -2417,10 +2457,13 @@ class ReportGenerationWorker(QThread):
                     parts = content.splitlines()
                     content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
 
-                code = content.strip()
+                code = normalize_generated_code(content.strip())
                 if not code:
                     self.error.emit("未获取到有效的代码内容")
                     return
+
+                latest_code = code
+                self.code_ready.emit(code)
 
                 try:
                     script_path.write_text(code, encoding="utf-8")
@@ -2447,7 +2490,7 @@ class ReportGenerationWorker(QThread):
                     stdout = (proc.stdout or "").strip()
                     stderr = (proc.stderr or "").strip()
                     if proc.returncode == 0 and stdout:
-                        self.success.emit(stdout)
+                        self.success.emit(stdout, latest_code)
                         return
                     if proc.returncode == 0:
                         last_error = "脚本执行成功但未返回HTML内容"
@@ -2548,7 +2591,7 @@ class ScraperWorker(QThread):
             """
         ).strip()
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2595,7 +2638,7 @@ class ScraperWorker(QThread):
                     parts = content.splitlines()
                     content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
 
-                code = content.strip()
+                code = normalize_generated_code(content.strip())
                 if not code:
                     self.error.emit("未获取到有效的爬虫代码")
                     return
@@ -2715,6 +2758,8 @@ class DataReporterWidget(QWidget):
         self.quick_placeholder: Optional[QLabel] = None
         self._quick_request_serial: int = 0
         self._latest_detection_hint: str = ""
+        self.latest_report_html: str = ""
+        self.latest_report_code: str = ""
         self.setAcceptDrops(True)
         self._build_ui()
 
@@ -2752,6 +2797,13 @@ class DataReporterWidget(QWidget):
         self.preview_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.preview_table.horizontalHeader().setStretchLastSection(True)
         preview_layout.addWidget(self.preview_table)
+        data_btn_row = QHBoxLayout()
+        self.btn_export_data = QPushButton("导出当前数据…")
+        self.btn_export_data.setEnabled(False)
+        self.btn_export_data.clicked.connect(self._export_current_data)
+        data_btn_row.addWidget(self.btn_export_data)
+        data_btn_row.addStretch()
+        preview_layout.addLayout(data_btn_row)
         left_layout.addWidget(preview_group, 1)
 
         instruction_group = QGroupBox("分析需求")
@@ -2784,11 +2836,28 @@ class DataReporterWidget(QWidget):
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
-        report_group = QGroupBox("报告预览")
+        report_group = QGroupBox("报告与代码")
         report_layout = QVBoxLayout(report_group)
+        self.report_tabs = QTabWidget()
         self.report_view = QWebEngineView()
         self.report_view.setHtml("<h3 style='color:#94a3b8;'>生成的报告将在此显示</h3>")
-        report_layout.addWidget(self.report_view)
+        self.report_tabs.addTab(self.report_view, "报表预览")
+        self.code_view = QPlainTextEdit()
+        self.code_view.setReadOnly(True)
+        self.code_view.setPlaceholderText("生成的 Python 代码将显示在此处。")
+        self.report_tabs.addTab(self.code_view, "生成代码")
+        report_layout.addWidget(self.report_tabs)
+        report_btn_row = QHBoxLayout()
+        self.btn_export_report_html = QPushButton("导出报表…")
+        self.btn_export_report_html.setEnabled(False)
+        self.btn_export_report_html.clicked.connect(self._export_report_html)
+        report_btn_row.addWidget(self.btn_export_report_html)
+        self.btn_export_report_code = QPushButton("导出代码…")
+        self.btn_export_report_code.setEnabled(False)
+        self.btn_export_report_code.clicked.connect(self._export_report_code)
+        report_btn_row.addWidget(self.btn_export_report_code)
+        report_btn_row.addStretch()
+        report_layout.addLayout(report_btn_row)
         right_layout.addWidget(report_group, 1)
 
         main_layout.addWidget(left_container, 1)
@@ -2894,6 +2963,16 @@ class DataReporterWidget(QWidget):
         self.summary_label.setText(f"记录数：{rows} 行 × {cols} 列")
         self._populate_preview(df)
         self.report_view.setHtml("<h3 style='color:#94a3b8;'>请生成新的报告</h3>")
+        if hasattr(self, "code_view"):
+            self.code_view.clear()
+        self.latest_report_html = ""
+        self.latest_report_code = ""
+        if hasattr(self, "btn_export_report_html"):
+            self.btn_export_report_html.setEnabled(False)
+        if hasattr(self, "btn_export_report_code"):
+            self.btn_export_report_code.setEnabled(False)
+        if hasattr(self, "btn_export_data"):
+            self.btn_export_data.setEnabled(True)
         self._trigger_quick_suggestions()
 
     def _populate_preview(self, df: pd.DataFrame):
@@ -3041,15 +3120,38 @@ class DataReporterWidget(QWidget):
         worker = ReportGenerationWorker(api_key, sample_csv, list(self.current_df.columns), instruction, self.current_df.copy())
         worker.progress.connect(self._set_status)
         worker.error.connect(self._handle_report_error)
+        worker.code_ready.connect(self._handle_report_code)
         worker.success.connect(self._handle_report_success)
         worker.finished.connect(self._report_finished)
         self.report_worker = worker
         self.btn_generate.setEnabled(False)
+        if hasattr(self, "code_view"):
+            self.code_view.setPlainText("正在调用模型生成报告代码…")
+            if hasattr(self, "report_tabs"):
+                self.report_tabs.setCurrentWidget(self.code_view)
         self._set_status("正在生成数据报告…")
         worker.start()
 
-    def _handle_report_success(self, html: str):
+    def _handle_report_code(self, code: str):
+        if not hasattr(self, "code_view"):
+            return
+        display = code or ""
+        self.code_view.setPlainText(display)
+        self.latest_report_code = code
+        if hasattr(self, "btn_export_report_code"):
+            self.btn_export_report_code.setEnabled(bool(code.strip()))
+        sb = self.code_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _handle_report_success(self, html: str, code: str):
+        self._handle_report_code(code)
         self.report_view.setHtml(html)
+        self.latest_report_html = html
+        if hasattr(self, "btn_export_report_html"):
+            self.btn_export_report_html.setEnabled(bool((html or "").strip()))
+        if hasattr(self, "report_tabs"):
+            self.report_tabs.setCurrentWidget(self.report_view)
         self._set_status("报告生成完成")
 
     def _handle_report_error(self, message: str):
@@ -3059,6 +3161,104 @@ class DataReporterWidget(QWidget):
     def _report_finished(self):
         self.btn_generate.setEnabled(True)
         self.report_worker = None
+
+    def _export_report_html(self):
+        html = (self.latest_report_html or "").strip()
+        if not html:
+            QMessageBox.information(self, "提示", "当前没有可导出的报表，请先生成报告。")
+            return
+        default_path = self._default_export_path("数据分析报告.html")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出数据报表",
+            default_path,
+            "HTML 文件 (*.html *.htm)",
+        )
+        if not path:
+            return
+        export_path = Path(path)
+        if export_path.suffix.lower() not in {".html", ".htm"}:
+            export_path = export_path.with_suffix(".html")
+        try:
+            export_path.write_text(html, encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"写入文件失败：{e}")
+            return
+        self.settings.update(last_ai_export_path=str(export_path.parent))
+        self._set_status(f"报表已导出：{export_path}")
+        QMessageBox.information(self, "导出完成", f"报表已导出至：\n{export_path}")
+
+    def _export_report_code(self):
+        code = (self.latest_report_code or "").strip()
+        if not code:
+            QMessageBox.information(self, "提示", "当前没有可导出的代码，请先生成报告。")
+            return
+        default_path = self._default_export_path("report_generator.py")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出生成代码",
+            default_path,
+            "Python 文件 (*.py)",
+        )
+        if not path:
+            return
+        export_path = Path(path)
+        if export_path.suffix.lower() != ".py":
+            export_path = export_path.with_suffix(".py")
+        try:
+            export_path.write_text(self.latest_report_code, encoding="utf-8")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"写入文件失败：{e}")
+            return
+        self.settings.update(last_ai_export_path=str(export_path.parent))
+        self._set_status(f"代码已导出：{export_path}")
+        QMessageBox.information(self, "导出完成", f"代码已导出至：\n{export_path}")
+
+    def _export_current_data(self):
+        if self.current_df is None:
+            QMessageBox.information(self, "提示", "当前没有可导出的数据集。")
+            return
+        default_filename = "导出数据.csv"
+        default_path = self._default_export_path(default_filename)
+        filters = "CSV 文件 (*.csv);;Excel 工作簿 (*.xlsx)"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出当前数据",
+            default_path,
+            filters,
+        )
+        if not path:
+            return
+        export_path = Path(path)
+        chosen_filter = (selected_filter or "").lower()
+        try:
+            if "xlsx" in chosen_filter:
+                if export_path.suffix.lower() != ".xlsx":
+                    export_path = export_path.with_suffix(".xlsx")
+                self.current_df.to_excel(export_path, index=False)
+            else:
+                if export_path.suffix.lower() != ".csv":
+                    export_path = export_path.with_suffix(".csv")
+                self.current_df.to_csv(export_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"保存数据失败：{e}")
+            return
+        self.settings.update(last_ai_export_path=str(export_path.parent))
+        self._set_status(f"数据已导出：{export_path}")
+        QMessageBox.information(self, "导出完成", f"数据已导出至：\n{export_path}")
+
+    def _default_export_path(self, filename: str) -> str:
+        base_dir = (self.settings.get("last_ai_export_path", "") or "").strip()
+        if base_dir:
+            try:
+                base_path = Path(base_dir)
+                if base_path.exists() and not base_path.is_dir():
+                    base_path = base_path.parent
+                if base_path.exists() or base_path.parent.exists():
+                    return str(base_path / filename)
+            except Exception:
+                pass
+        return filename
 
     def _apply_preset_instruction(self, text: str):
         self.instruction_edit.setPlainText(text)
