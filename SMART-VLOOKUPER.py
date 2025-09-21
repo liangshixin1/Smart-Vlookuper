@@ -29,7 +29,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 import gc
 from thefuzz import fuzz
 from copy import copy
-from typing import List, Optional
+from typing import List, Optional, Union, Mapping, Any
 
 # —— 静默 openpyxl 的数据验证扩展警告 ——
 warnings.filterwarnings(
@@ -939,10 +939,71 @@ class IntentWorker(QThread):
     results = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, api_key: str, tables: List[str]):
+    def __init__(self, api_key: str, tables):
         super().__init__()
         self.api_key = api_key
-        self.tables = [str(p) for p in tables]
+        self.tables = list(tables) if tables is not None else []
+
+    def _read_dataframe(self, path: Path, as_string: bool) -> pd.DataFrame:
+        if as_string:
+            if path.suffix.lower() == ".csv":
+                df = pd.read_csv(path, dtype=str)
+            else:
+                df = pd.read_excel(path, dtype=str, engine="openpyxl")
+            return df.fillna("")
+        if path.suffix.lower() == ".csv":
+            return pd.read_csv(path)
+        return pd.read_excel(path, engine="openpyxl")
+
+    def _prepare_entry(self, item) -> dict:
+        path_obj: Optional[Path] = None
+        dataframe_input: Optional[pd.DataFrame] = None
+        display_name = ""
+
+        if isinstance(item, Mapping):
+            raw_path = item.get("path")
+            if raw_path:
+                path_obj = Path(raw_path)
+            df_candidate = item.get("dataframe")
+            if isinstance(df_candidate, pd.DataFrame):
+                dataframe_input = df_candidate
+            elif df_candidate is not None:
+                raise TypeError("dataframe 字段必须是 pandas.DataFrame")
+            display_name = str(item.get("name") or item.get("display_name") or item.get("label") or "")
+        elif isinstance(item, pd.DataFrame):
+            dataframe_input = item
+        elif isinstance(item, (str, Path)):
+            path_obj = Path(item)
+        else:
+            raise TypeError("不支持的表格类型")
+
+        if not display_name:
+            if path_obj is not None:
+                display_name = path_obj.name
+            else:
+                display_name = "数据集"
+
+        if dataframe_input is not None:
+            df_full = dataframe_input.copy()
+            df_preview = dataframe_input.fillna("").astype(str)
+        else:
+            if path_obj is None:
+                raise ValueError("缺少表格路径或数据。")
+            try:
+                df_preview = self._read_dataframe(path_obj, as_string=True)
+            except Exception as e:
+                raise RuntimeError(f"无法读取表格：{path_obj} - {e}") from e
+            try:
+                df_full = self._read_dataframe(path_obj, as_string=False)
+            except Exception:
+                df_full = df_preview.copy()
+
+        return {
+            "name": display_name,
+            "path": path_obj,
+            "df_preview": df_preview,
+            "df_full": df_full,
+        }
 
     def run(self):
         if not self.tables:
@@ -956,25 +1017,23 @@ class IntentWorker(QThread):
             return
 
         table_chunks = []
-        for path in self.tables:
+        for item in self.tables:
             if self.isInterruptionRequested():
                 return
             try:
-                df = pd.read_excel(path, dtype=str).fillna("")
+                entry = self._prepare_entry(item)
             except Exception as e:
-                self.error.emit(f"无法读取表格：{path} - {e}")
+                self.error.emit(str(e))
                 return
-            sanitized_df, sensitive_map = desensitize_dataframe(df)
+
+            df_preview = entry["df_preview"]
+            sanitized_df, sensitive_map = desensitize_dataframe(df_preview)
             sample_csv = sanitized_df.head(5).to_csv(index=False).strip()
-            columns = json.dumps([str(c) for c in df.columns], ensure_ascii=False)
-            fingerprint = ""
-            try:
-                df_full = pd.read_excel(path)
-            except Exception:
-                df_full = None
-            fingerprint = generate_dataframe_fingerprint(df_full if df_full is not None else df)
+            columns = json.dumps([str(c) for c in df_preview.columns], ensure_ascii=False)
+            df_full = entry.get("df_full")
+            fingerprint = generate_dataframe_fingerprint(df_full if df_full is not None else df_preview)
             chunk_lines = [
-                f"文件名: {Path(path).name}",
+                f"数据集: {entry['name']}",
                 f"列名: {columns}",
             ]
             if sensitive_map:
@@ -986,7 +1045,7 @@ class IntentWorker(QThread):
                 chunk_lines.append(fingerprint)
             table_chunks.append("\n".join(chunk_lines))
 
-        prompt_text = "以下是一个或多个Excel表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
+        prompt_text = "以下是一个或多个表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
 
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
         try:
@@ -2648,8 +2707,14 @@ class DataReporterWidget(QWidget):
         self.current_df: Optional[pd.DataFrame] = None
         self.sanitized_df: Optional[pd.DataFrame] = None
         self.current_source: str = ""
+        self.current_path: Optional[Path] = None
         self.report_worker: Optional[ReportGenerationWorker] = None
         self.scraper_worker: Optional[ScraperWorker] = None
+        self.quick_worker: Optional[IntentWorker] = None
+        self.quick_buttons: List[QPushButton] = []
+        self.quick_placeholder: Optional[QLabel] = None
+        self._quick_request_serial: int = 0
+        self._latest_detection_hint: str = ""
         self.setAcceptDrops(True)
         self._build_ui()
 
@@ -2691,24 +2756,17 @@ class DataReporterWidget(QWidget):
 
         instruction_group = QGroupBox("分析需求")
         instruction_layout = QVBoxLayout(instruction_group)
-        presets_layout = QHBoxLayout()
-        presets_label = QLabel("快速指令：")
-        presets_label.setStyleSheet("color: #94a3b8;")
-        presets_layout.addWidget(presets_label)
-        preset_configs = [
-            ("销售分析", "请梳理各产品线的销售额与利润贡献，输出同比/环比趋势、Top5品类以及关键驱动因素。"),
-            ("用户画像", "请分析主要客户群的年龄、地区、消费频次等结构特征，并给出差异化运营建议。"),
-            ("财务监控", "请输出收入、成本、毛利率等核心指标的趋势分析，并标注异常波动与可能原因。"),
-        ]
-        self.preset_buttons = []
-        for title, text in preset_configs:
-            btn = QPushButton(title)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _, t=text: self._apply_preset_instruction(t))
-            presets_layout.addWidget(btn)
-            self.preset_buttons.append(btn)
-        presets_layout.addStretch()
-        instruction_layout.addLayout(presets_layout)
+        quick_row = QHBoxLayout()
+        quick_label = QLabel("快速指令：")
+        quick_label.setStyleSheet("color: #94a3b8;")
+        quick_row.addWidget(quick_label)
+        self.quick_container = QWidget()
+        self.quick_container_layout = QHBoxLayout(self.quick_container)
+        self.quick_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.quick_container_layout.setSpacing(6)
+        quick_row.addWidget(self.quick_container, 1)
+        instruction_layout.addLayout(quick_row)
+        self._set_quick_placeholder("加载数据后将自动推荐常见分析任务。")
         self.instruction_edit = QPlainTextEdit()
         self.instruction_edit.setPlaceholderText("例如：分析各产品销售额占比，并给出关键洞察。")
         self.instruction_edit.setMinimumHeight(120)
@@ -2775,30 +2833,68 @@ class DataReporterWidget(QWidget):
     def _handle_scraper_success(self, df: pd.DataFrame, url: str):
         self.scraper_worker = None
         self._adopt_dataframe(df, f"来自网页数据：{url}")
-        self._set_status("已加载爬取数据，请输入分析需求。")
+        self._set_status_with_hint("已加载爬取数据，请输入分析需求。")
 
     def _load_file(self, path: Path):
-        try:
-            if path.suffix.lower() == ".csv":
+        detection_hint = ""
+        if path.suffix.lower() == ".csv":
+            try:
                 df = pd.read_csv(path)
-            else:
-                df = pd.read_excel(path)
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
-            return
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
+                return
+            detection_hint = "CSV 文件默认使用首行作为表头。"
+        else:
+            try:
+                sheet_names = get_sheet_names_safely(path)
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"读取工作表失败：{e}")
+                return
+            if not sheet_names:
+                QMessageBox.critical(self, "错误", "该工作簿中没有可用的工作表。")
+                return
+            sheet_name = sheet_names[0]
+            try:
+                header_row, start_col = auto_detect_header_start(path, sheet_name)
+                detection_hint = f"自动识别表头：第{header_row}行，数据起始列：第{start_col}列。"
+                structure_df = read_excel_dataframe(path, sheet_name, header_row, start_col)
+                df = pd.read_excel(
+                    path,
+                    sheet_name=sheet_name,
+                    header=header_row - 1,
+                    engine="openpyxl",
+                )
+                if start_col > 1:
+                    df = df.iloc[:, start_col - 1 :]
+                df = df.dropna(how="all")
+                df.columns = structure_df.columns
+            except Exception as detect_err:
+                try:
+                    df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
+                    return
+                detail = str(detect_err).strip().splitlines()[0]
+                if detail:
+                    detection_hint = f"自动识别表头失败，已按默认方式读取。原因：{detail}"
+                else:
+                    detection_hint = "自动识别表头失败，已按默认方式读取。"
 
-        self._adopt_dataframe(df, f"本地文件：{path.name}")
-        self._set_status("已加载本地数据，请输入分析需求。")
+        self._adopt_dataframe(df, f"本地文件：{path.name}", path, detection_hint)
+        self._set_status_with_hint("已加载本地数据，请输入分析需求。")
 
-    def _adopt_dataframe(self, df: pd.DataFrame, source_desc: str):
+    def _adopt_dataframe(self, df: pd.DataFrame, source_desc: str, source_path: Optional[Path] = None, detection_hint: str = ""):
         self.current_df = df.copy()
         self.sanitized_df, _ = desensitize_dataframe(df)
         self.current_source = source_desc
+        self.current_path = source_path
+        self._latest_detection_hint = detection_hint.strip()
         self.source_label.setText(source_desc)
         rows, cols = df.shape
         self.summary_label.setText(f"记录数：{rows} 行 × {cols} 列")
         self._populate_preview(df)
         self.report_view.setHtml("<h3 style='color:#94a3b8;'>请生成新的报告</h3>")
+        self._trigger_quick_suggestions()
 
     def _populate_preview(self, df: pd.DataFrame):
         if df is None:
@@ -2816,6 +2912,111 @@ class DataReporterWidget(QWidget):
                 item = QTableWidgetItem(str(value))
                 self.preview_table.setItem(r, c, item)
         self.preview_table.resizeColumnsToContents()
+
+    def _clear_quick_container(self):
+        if not hasattr(self, "quick_container_layout"):
+            return
+        while self.quick_container_layout.count():
+            item = self.quick_container_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _set_quick_placeholder(self, text: str):
+        self.quick_buttons.clear()
+        self._clear_quick_container()
+        label = QLabel(text)
+        label.setStyleSheet("color: #94a3b8;")
+        self.quick_placeholder = label
+        self.quick_container_layout.addWidget(label)
+        self.quick_container_layout.addStretch()
+
+    def _show_quick_buttons(self, texts: List[str]):
+        self._clear_quick_container()
+        self.quick_buttons.clear()
+        for text in texts:
+            btn = QPushButton(text)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, t=text: self._apply_preset_instruction(t))
+            self.quick_container_layout.addWidget(btn)
+            self.quick_buttons.append(btn)
+        self.quick_placeholder = None
+        self.quick_container_layout.addStretch()
+
+    def _stop_quick_worker(self):
+        if self.quick_worker and self.quick_worker.isRunning():
+            self.quick_worker.requestInterruption()
+            self.quick_worker.wait(200)
+        self.quick_worker = None
+
+    def _trigger_quick_suggestions(self):
+        if not hasattr(self, "quick_container_layout"):
+            return
+        self._stop_quick_worker()
+        if self.current_df is None:
+            self._set_quick_placeholder("请先选择数据源。")
+            return
+        if self.current_df.empty:
+            self._set_quick_placeholder("当前数据为空，无法推荐分析指令。")
+            return
+        api_key = (self.settings.get("report_api_key", "") or "").strip()
+        if not api_key:
+            self._set_quick_placeholder("请在设置中配置数据报表模块的 API Key。")
+            return
+
+        self._quick_request_serial += 1
+        request_id = self._quick_request_serial
+        entry = {
+            "dataframe": self.current_df.head(200).copy(),
+            "name": self.current_source or (self.current_path.name if self.current_path else "数据集"),
+        }
+        if self.current_path:
+            entry["path"] = str(self.current_path)
+        self._set_quick_placeholder("正在分析常见分析需求…")
+        worker = IntentWorker(api_key, [entry])
+        worker.results.connect(lambda intents, rid=request_id: self._on_quick_intents_ready(rid, intents))
+        worker.error.connect(lambda message, rid=request_id: self._on_quick_intents_error(rid, message))
+        worker.finished.connect(self._on_quick_worker_finished)
+        self.quick_worker = worker
+        worker.start()
+
+    def _on_quick_intents_ready(self, request_id: int, intents: List[str]):
+        if request_id != self._quick_request_serial:
+            return
+        cleaned = []
+        for item in intents:
+            text = str(item).strip()
+            if text:
+                cleaned.append(text)
+        if not cleaned:
+            self._set_quick_placeholder("未能识别常见分析指令，请手动描述需求。")
+            return
+        self._show_quick_buttons(cleaned[:5])
+        self._set_status_with_hint("已推荐常见分析需求，可直接点击或继续编辑。")
+
+    def _on_quick_intents_error(self, request_id: int, message: str):
+        if request_id != self._quick_request_serial:
+            return
+        self._set_quick_placeholder("未能获取推荐指令，请手动描述需求。")
+        first_line = (message or "").splitlines()[0] if message else ""
+        if first_line:
+            self._set_status(f"推荐指令获取失败：{first_line}")
+        else:
+            self._set_status("推荐指令获取失败。")
+
+    def _on_quick_worker_finished(self):
+        self.quick_worker = None
+
+    def _set_status_with_hint(self, base_text: str):
+        base = base_text.strip()
+        hint = self._latest_detection_hint.strip()
+        if hint:
+            if base:
+                self._set_status(f"{base} {hint}")
+            else:
+                self._set_status(hint)
+        else:
+            self._set_status(base)
 
     # ---- 报告生成 ----
     def generate_report(self):
@@ -2861,7 +3062,7 @@ class DataReporterWidget(QWidget):
 
     def _apply_preset_instruction(self, text: str):
         self.instruction_edit.setPlainText(text)
-        self._set_status("已应用预设分析模板，可直接生成或继续编辑。")
+        self._set_status_with_hint("已应用快速指令，可直接生成或继续编辑。")
 
     def _set_status(self, text: str):
         self.status_label.setText(text)
@@ -3012,11 +3213,47 @@ class DataCleanerWidget(QWidget):
             "数据文件 (*.xlsx *.xlsm *.xls *.csv)"
         )
         if path:
+            detection_hint = ""
             try:
                 if path.lower().endswith(".csv"):
                     df = pd.read_csv(path)
+                    detection_hint = "CSV 文件默认使用首行作为表头。"
                 else:
-                    df = pd.read_excel(path)
+                    path_obj = Path(path)
+                    try:
+                        sheet_names = get_sheet_names_safely(path_obj)
+                    except Exception as e:
+                        QMessageBox.critical(self, "错误", f"读取工作表失败：{e}")
+                        return
+                    if not sheet_names:
+                        QMessageBox.critical(self, "错误", "该工作簿中没有可用的工作表。")
+                        return
+                    sheet_name = sheet_names[0]
+                    try:
+                        header_row, start_col = auto_detect_header_start(path_obj, sheet_name)
+                        detection_hint = f"自动识别表头：第{header_row}行，数据起始列：第{start_col}列。"
+                        structure_df = read_excel_dataframe(path_obj, sheet_name, header_row, start_col)
+                        df = pd.read_excel(
+                            path_obj,
+                            sheet_name=sheet_name,
+                            header=header_row - 1,
+                            engine="openpyxl",
+                        )
+                        if start_col > 1:
+                            df = df.iloc[:, start_col - 1 :]
+                        df = df.dropna(how="all")
+                        df.columns = structure_df.columns
+                    except Exception as detect_err:
+                        try:
+                            df = pd.read_excel(path_obj, sheet_name=sheet_name, engine="openpyxl")
+                        except Exception as e:
+                            QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
+                            return
+                        detail = str(detect_err).strip().splitlines()[0]
+                        if detail:
+                            detection_hint = f"自动识别表头失败，已按默认方式读取。原因：{detail}"
+                        else:
+                            detection_hint = "自动识别表头失败，已按默认方式读取。"
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"读取文件失败：{e}")
                 return
@@ -3024,7 +3261,10 @@ class DataCleanerWidget(QWidget):
             self.current_path = Path(path)
             self.path_label.setText(f"当前文件：{Path(path).name}")
             self._refresh_preview()
-            self._set_status("数据已加载，可选择清洗操作。")
+            status = "数据已加载，可选择清洗操作。"
+            if detection_hint:
+                status = f"{status} {detection_hint}"
+            self._set_status(status.strip())
 
     def export_file(self):
         if self.current_df is None:
