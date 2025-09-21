@@ -2261,6 +2261,8 @@ class ReportGenerationWorker(QThread):
                     [sys.executable, str(script_path)],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     cwd=td,
                     env=env,
                     timeout=180,
@@ -2269,8 +2271,8 @@ class ReportGenerationWorker(QThread):
                 self.error.emit(f"执行脚本失败：{e}")
                 return
 
-        stdout = proc.stdout.strip()
-        stderr = proc.stderr.strip()
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
         if proc.returncode != 0:
             err_text = stderr or stdout or "未知错误"
             self.error.emit(f"脚本执行失败：{err_text}")
@@ -2384,6 +2386,8 @@ class ScraperWorker(QThread):
                     [sys.executable, str(script_path)],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     cwd=td,
                     env=env,
                     timeout=180,
@@ -2392,8 +2396,8 @@ class ScraperWorker(QThread):
                 self.error.emit(f"执行爬虫失败：{e}")
                 return
 
-            stdout = proc.stdout.strip()
-            stderr = proc.stderr.strip()
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
             if proc.returncode != 0:
                 err_text = stderr or stdout or "未知错误"
                 self.error.emit(f"爬虫脚本执行失败：{err_text}")
