@@ -797,7 +797,7 @@ class AIWorker(QThread):
         base_prompt = env_instructions + "\n\n" + task_block
 
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
         attempt, last_err, last_code = 0, None, ""
         while attempt < 3:
             if self.isInterruptionRequested():
@@ -1047,7 +1047,7 @@ class IntentWorker(QThread):
 
         prompt_text = "以下是一个或多个表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
         try:
             response = client.chat.completions.create(
                 model="deepseek-chat",
@@ -2306,7 +2306,8 @@ class DataMatchingWidget(QWidget):
 class ReportGenerationWorker(QThread):
     progress = pyqtSignal(str)
     error = pyqtSignal(str)
-    success = pyqtSignal(str)
+    success = pyqtSignal(str, str)
+    code_ready = pyqtSignal(str)
 
     def __init__(self, api_key: str, sample_csv: str, columns: List[str], instruction: str, dataframe: pd.DataFrame):
         super().__init__()
@@ -2365,7 +2366,7 @@ class ReportGenerationWorker(QThread):
             return
 
         system_prompt, user_prompt = self._prepare_prompt()
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2389,6 +2390,7 @@ class ReportGenerationWorker(QThread):
             env["PYTHONIOENCODING"] = "utf-8"
 
             script_path = Path(td) / "report.py"
+            latest_code = ""
 
             for attempt in range(max_attempts):
                 if attempt == 0:
@@ -2422,6 +2424,9 @@ class ReportGenerationWorker(QThread):
                     self.error.emit("未获取到有效的代码内容")
                     return
 
+                latest_code = code
+                self.code_ready.emit(code)
+
                 try:
                     script_path.write_text(code, encoding="utf-8")
                 except Exception as e:
@@ -2447,7 +2452,7 @@ class ReportGenerationWorker(QThread):
                     stdout = (proc.stdout or "").strip()
                     stderr = (proc.stderr or "").strip()
                     if proc.returncode == 0 and stdout:
-                        self.success.emit(stdout)
+                        self.success.emit(stdout, latest_code)
                         return
                     if proc.returncode == 0:
                         last_error = "脚本执行成功但未返回HTML内容"
@@ -2548,7 +2553,7 @@ class ScraperWorker(QThread):
             """
         ).strip()
 
-        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+        client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -2784,11 +2789,17 @@ class DataReporterWidget(QWidget):
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
-        report_group = QGroupBox("报告预览")
+        report_group = QGroupBox("报告与代码")
         report_layout = QVBoxLayout(report_group)
+        self.report_tabs = QTabWidget()
         self.report_view = QWebEngineView()
         self.report_view.setHtml("<h3 style='color:#94a3b8;'>生成的报告将在此显示</h3>")
-        report_layout.addWidget(self.report_view)
+        self.report_tabs.addTab(self.report_view, "报表预览")
+        self.code_view = QPlainTextEdit()
+        self.code_view.setReadOnly(True)
+        self.code_view.setPlaceholderText("生成的 Python 代码将显示在此处。")
+        self.report_tabs.addTab(self.code_view, "生成代码")
+        report_layout.addWidget(self.report_tabs)
         right_layout.addWidget(report_group, 1)
 
         main_layout.addWidget(left_container, 1)
@@ -2894,6 +2905,8 @@ class DataReporterWidget(QWidget):
         self.summary_label.setText(f"记录数：{rows} 行 × {cols} 列")
         self._populate_preview(df)
         self.report_view.setHtml("<h3 style='color:#94a3b8;'>请生成新的报告</h3>")
+        if hasattr(self, "code_view"):
+            self.code_view.clear()
         self._trigger_quick_suggestions()
 
     def _populate_preview(self, df: pd.DataFrame):
@@ -3041,15 +3054,32 @@ class DataReporterWidget(QWidget):
         worker = ReportGenerationWorker(api_key, sample_csv, list(self.current_df.columns), instruction, self.current_df.copy())
         worker.progress.connect(self._set_status)
         worker.error.connect(self._handle_report_error)
+        worker.code_ready.connect(self._handle_report_code)
         worker.success.connect(self._handle_report_success)
         worker.finished.connect(self._report_finished)
         self.report_worker = worker
         self.btn_generate.setEnabled(False)
+        if hasattr(self, "code_view"):
+            self.code_view.setPlainText("正在调用模型生成报告代码…")
+            if hasattr(self, "report_tabs"):
+                self.report_tabs.setCurrentWidget(self.code_view)
         self._set_status("正在生成数据报告…")
         worker.start()
 
-    def _handle_report_success(self, html: str):
+    def _handle_report_code(self, code: str):
+        if not hasattr(self, "code_view"):
+            return
+        display = code or ""
+        self.code_view.setPlainText(display)
+        sb = self.code_view.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _handle_report_success(self, html: str, code: str):
+        self._handle_report_code(code)
         self.report_view.setHtml(html)
+        if hasattr(self, "report_tabs"):
+            self.report_tabs.setCurrentWidget(self.report_view)
         self._set_status("报告生成完成")
 
     def _handle_report_error(self, message: str):
