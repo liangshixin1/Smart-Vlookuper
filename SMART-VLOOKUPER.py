@@ -294,6 +294,86 @@ def desensitize_dataframe(df: pd.DataFrame):
             sensitive_columns[col] = category
     return sanitized, sensitive_columns
 
+
+def generate_dataframe_fingerprint(
+    df: pd.DataFrame,
+    max_value_columns: int = 6,
+    max_category_items: int = 6,
+    max_chars: int = 4000
+) -> str:
+    """构建数据指纹，帮助LLM了解完整数据集的结构与分布"""
+
+    if df is None or not isinstance(df, pd.DataFrame):
+        return "(无可用指纹信息)"
+
+    sections: list[str] = []
+
+    buffer = io.StringIO()
+    try:
+        df.info(buf=buffer)
+    except Exception:
+        info_text = "无法生成 df.info() 摘要。"
+    else:
+        info_text = buffer.getvalue().strip()
+    if info_text:
+        sections.append("[DataFrame.info]\n" + info_text)
+
+    try:
+        numeric_cols = df.select_dtypes(include=["number"])
+        if not numeric_cols.empty:
+            desc = numeric_cols.describe().transpose().head(max_value_columns)
+            sections.append("[数值列统计]\n" + desc.to_string())
+    except Exception:
+        pass
+
+    try:
+        datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, tz]"])
+        if not datetime_cols.empty:
+            lines = []
+            for col in list(datetime_cols.columns)[:max_value_columns]:
+                series = datetime_cols[col].dropna()
+                if series.empty:
+                    lines.append(f"{col}: 无有效日期")
+                else:
+                    lines.append(
+                        f"{col}: {series.min()} ~ {series.max()} (样本 {series.size})"
+                    )
+            if lines:
+                sections.append("[日期列范围]\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    try:
+        category_cols = df.select_dtypes(include=["object", "category", "bool"])
+        if not category_cols.empty:
+            cat_lines = []
+            for col in list(category_cols.columns)[:max_value_columns]:
+                try:
+                    vc = category_cols[col].astype(str).value_counts(dropna=False).head(max_category_items)
+                except Exception:
+                    continue
+                if vc.empty:
+                    cat_lines.append(f"{col}: （无数据）")
+                    continue
+                formatted = []
+                for idx, cnt in vc.items():
+                    value = str(idx)
+                    if len(value) > 40:
+                        value = value[:40] + "…"
+                    formatted.append(f"{value}({cnt})")
+                cat_lines.append(f"{col}: " + ", ".join(formatted))
+            if cat_lines:
+                sections.append("[类别列分布]\n" + "\n".join(cat_lines))
+    except Exception:
+        pass
+
+    fingerprint = "\n\n".join(sections).strip()
+    if not fingerprint:
+        fingerprint = "(无可用指纹信息)"
+    if len(fingerprint) > max_chars:
+        fingerprint = fingerprint[:max_chars] + "\n…(指纹信息已截断)"
+    return fingerprint
+
 def find_best_match(target_field, source_fields, threshold=85):
     """
     【新增】使用多层策略为目标字段查找最佳的源字段匹配
@@ -626,6 +706,12 @@ class AIWorker(QThread):
             sample = sanitized_df.head(5).to_csv(sep='\t', index=False).strip()
             cols = ", ".join(map(str, df.columns))
             all_columns.update(df.columns)
+            fingerprint = ""
+            try:
+                df_full = pd.read_excel(p)
+            except Exception:
+                df_full = None
+            fingerprint = generate_dataframe_fingerprint(df_full if df_full is not None else df)
             block_lines = [
                 f"## {Path(p).name}",
                 f"路径: {p}",
@@ -635,6 +721,9 @@ class AIWorker(QThread):
                 block_lines.append(f"已自动脱敏列: {', '.join(sensitive_map.keys())}")
             block_lines.append("示例:")
             block_lines.append(sample or "(空表)")
+            if fingerprint:
+                block_lines.append("数据指纹:")
+                block_lines.append(fingerprint)
             table_texts.append("\n".join(block_lines))
 
         try:
@@ -878,6 +967,12 @@ class IntentWorker(QThread):
             sanitized_df, sensitive_map = desensitize_dataframe(df)
             sample_csv = sanitized_df.head(5).to_csv(index=False).strip()
             columns = json.dumps([str(c) for c in df.columns], ensure_ascii=False)
+            fingerprint = ""
+            try:
+                df_full = pd.read_excel(path)
+            except Exception:
+                df_full = None
+            fingerprint = generate_dataframe_fingerprint(df_full if df_full is not None else df)
             chunk_lines = [
                 f"文件名: {Path(path).name}",
                 f"列名: {columns}",
@@ -886,6 +981,9 @@ class IntentWorker(QThread):
                 chunk_lines.append(f"已自动脱敏列: {', '.join(sensitive_map.keys())}")
             chunk_lines.append("数据样本:")
             chunk_lines.append(sample_csv or "(空表)")
+            if fingerprint:
+                chunk_lines.append("数据指纹:")
+                chunk_lines.append(fingerprint)
             table_chunks.append("\n".join(chunk_lines))
 
         prompt_text = "以下是一个或多个Excel表格的结构与数据示例：\n\n" + "\n\n".join(table_chunks)
@@ -2163,6 +2261,7 @@ class ReportGenerationWorker(QThread):
         column_text = ", ".join(map(str, self.columns)) or "(无列信息)"
         preview_text = self.sample_csv.strip() or "(空表)"
         rows, cols = self.dataframe.shape
+        fingerprint_text = generate_dataframe_fingerprint(self.dataframe)
         system_prompt = textwrap.dedent(
             """
             你是一位资深数据分析师，需要基于提供的结构化数据生成可视化分析报告。
@@ -2172,6 +2271,7 @@ class ReportGenerationWorker(QThread):
             3. 生成包含标题、摘要、洞察段落和图表的完整 HTML 字符串，并通过 print(html_string) 输出。
             4. 禁止写入除标准输出外的任何文件，也不要尝试联网或安装依赖。
             5. 代码必须自包含，包含必要的 import 与数据处理逻辑。
+            6. 运行环境已预装 pandas、numpy、pyecharts、matplotlib，请勿导入其他第三方库或执行安装命令。
             """
         ).strip()
         user_prompt = textwrap.dedent(
@@ -2182,6 +2282,9 @@ class ReportGenerationWorker(QThread):
 
             [脱敏样本CSV]
             {preview_text}
+
+            [数据指纹]
+            {fingerprint_text}
 
             [分析需求]
             {self.instruction or '请给出全面的数据洞察、关键指标与图表建议。'}
@@ -2205,37 +2308,14 @@ class ReportGenerationWorker(QThread):
         system_prompt, user_prompt = self._prepare_prompt()
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
 
-        self.progress.emit("正在调用模型生成报告代码…")
-        try:
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                temperature=0.2,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-        except Exception as e:
-            self.error.emit(str(e))
-            return
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        content = ""
-        try:
-            content = (response.choices[0].message.content or "").strip()
-        except Exception:
-            self.error.emit("模型返回内容为空")
-            return
+        last_error = ""
+        max_attempts = 3
 
-        if content.startswith("```"):
-            parts = content.splitlines()
-            content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
-
-        code = content.strip()
-        if not code:
-            self.error.emit("未获取到有效的代码内容")
-            return
-
-        self.progress.emit("正在执行生成的分析脚本…")
         with tempfile.TemporaryDirectory() as td:
             data_path = Path(td) / "dataset.csv"
             try:
@@ -2244,45 +2324,94 @@ class ReportGenerationWorker(QThread):
                 self.error.emit(f"写入临时数据失败：{e}")
                 return
 
-            script_path = Path(td) / "report.py"
-            try:
-                script_path.write_text(code, encoding="utf-8")
-            except Exception as e:
-                self.error.emit(f"写入生成脚本失败：{e}")
-                return
-
             env = os.environ.copy()
             env.setdefault("PYTHONPATH", env.get("PYTHONPATH", ""))
             env["REPORT_CSV_PATH"] = str(data_path)
             env["PYTHONIOENCODING"] = "utf-8"
 
-            try:
-                proc = subprocess.run(
-                    [sys.executable, str(script_path)],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=td,
-                    env=env,
-                    timeout=180,
-                )
-            except Exception as e:
-                self.error.emit(f"执行脚本失败：{e}")
-                return
+            script_path = Path(td) / "report.py"
 
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if proc.returncode != 0:
-            err_text = stderr or stdout or "未知错误"
-            self.error.emit(f"脚本执行失败：{err_text}")
-            return
+            for attempt in range(max_attempts):
+                if attempt == 0:
+                    self.progress.emit("正在调用模型生成报告代码…")
+                else:
+                    self.progress.emit(f"正在请求模型修复脚本（第{attempt + 1}次尝试）…")
 
-        if not stdout:
-            self.error.emit("脚本执行成功但未返回HTML内容")
-            return
+                try:
+                    response = client.chat.completions.create(
+                        model="deepseek-chat",
+                        temperature=0.2,
+                        messages=messages,
+                    )
+                except Exception as e:
+                    self.error.emit(str(e))
+                    return
 
-        self.success.emit(stdout)
+                content = ""
+                try:
+                    content = (response.choices[0].message.content or "").strip()
+                except Exception:
+                    self.error.emit("模型返回内容为空")
+                    return
+
+                if content.startswith("```"):
+                    parts = content.splitlines()
+                    content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
+
+                code = content.strip()
+                if not code:
+                    self.error.emit("未获取到有效的代码内容")
+                    return
+
+                try:
+                    script_path.write_text(code, encoding="utf-8")
+                except Exception as e:
+                    self.error.emit(f"写入生成脚本失败：{e}")
+                    return
+
+                self.progress.emit("正在执行生成的分析脚本…")
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path)],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        cwd=td,
+                        env=env,
+                        timeout=180,
+                    )
+                except Exception as e:
+                    last_error = f"执行脚本失败：{e}"
+                    error_for_prompt = last_error
+                else:
+                    stdout = (proc.stdout or "").strip()
+                    stderr = (proc.stderr or "").strip()
+                    if proc.returncode == 0 and stdout:
+                        self.success.emit(stdout)
+                        return
+                    if proc.returncode == 0:
+                        last_error = "脚本执行成功但未返回HTML内容"
+                    else:
+                        last_error = stderr or stdout or "未知错误"
+                    error_for_prompt = stderr or stdout or last_error
+
+                if attempt == max_attempts - 1:
+                    break
+
+                condensed_error = summarize_error(error_for_prompt, self.columns)
+                prompt_error = error_for_prompt if len(error_for_prompt) <= 1500 else error_for_prompt[:1500] + "…"
+                messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "上述代码执行失败。错误摘要："
+                        f"{condensed_error}\n详细日志：{prompt_error}\n"
+                        "请在保留既有需求的基础上修复代码，并重新给出完整的可运行Python脚本。"
+                    ),
+                })
+
+        self.error.emit(f"报告生成失败：{last_error or '未知错误'}")
 
 
 class ScraperWorker(QThread):
@@ -2313,66 +2442,66 @@ class ScraperWorker(QThread):
             self.error.emit(f"未安装openai库: {e}")
             return
 
+        try:
+            import requests
+        except Exception as e:
+            self.error.emit(f"未安装requests库: {e}")
+            return
+
+        self.progress.emit("正在抓取网页结构信息…")
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            }
+            response = requests.get(self.url, headers=headers, timeout=20)
+            response.raise_for_status()
+            html_text = response.text
+        except Exception as e:
+            self.error.emit(f"获取网页HTML失败：{e}")
+            return
+
+        max_html_chars = 40000
+        html_excerpt = html_text[:max_html_chars]
+        if len(html_text) > max_html_chars:
+            html_excerpt += "\n<!-- HTML内容已截断，仅展示前40000字符 -->"
+
         system_prompt = textwrap.dedent(
             """
             你是一名善于编写可靠网络爬虫的工程师。
-            根据用户指令生成 Python 脚本：
-            1. 通过环境变量 SCRAPER_TARGET_URL 获取目标网页。
-            2. 使用 requests、BeautifulSoup4、pandas.read_html 或 json 解析等方式采集数据。
-            3. 将结果保存为 UTF-8 CSV 文件，路径由环境变量 SCRAPER_OUTPUT_PATH 提供。
-            4. 不要进行无限循环、安装依赖或执行与任务无关的操作。
-            5. 脚本完成后不得输出除必要日志外的内容。
+            请编写Python脚本并遵守以下约束：
+            1. 通过环境变量 SCRAPER_TARGET_URL 获取目标网页，使用 requests 请求并设置常见浏览器 User-Agent。
+            2. 运行环境已预装 requests、beautifulsoup4、lxml、pandas，请勿导入或安装其他第三方库。
+            3. 将采集到的结构化结果写入 UTF-8 CSV 文件，路径由环境变量 SCRAPER_OUTPUT_PATH 指定。
+            4. 避免无限循环和与任务无关的操作，必要日志可使用 print 输出。
             """
         ).strip()
+
         user_prompt = textwrap.dedent(
             f"""
             目标网址: {self.url}
-            爬取需求: {self.instruction}
+            用户需求: {self.instruction}
 
-            请生成满足要求的 Python 脚本。
+            [页面HTML快照]
+            {html_excerpt}
+
+            请基于上述真实HTML结构生成满足需求的Python脚本。
             """
         ).strip()
 
         client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
 
-        self.progress.emit("正在生成爬虫脚本…")
-        try:
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                temperature=0.2,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-        except Exception as e:
-            self.error.emit(str(e))
-            return
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        content = ""
-        try:
-            content = (response.choices[0].message.content or "").strip()
-        except Exception:
-            self.error.emit("模型返回内容为空")
-            return
-
-        if content.startswith("```"):
-            parts = content.splitlines()
-            content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
-
-        code = content.strip()
-        if not code:
-            self.error.emit("未获取到有效的爬虫代码")
-            return
+        last_error = ""
+        max_attempts = 3
 
         with tempfile.TemporaryDirectory() as td:
             output_path = Path(td) / "scraped.csv"
             script_path = Path(td) / "scraper.py"
-            try:
-                script_path.write_text(code, encoding="utf-8")
-            except Exception as e:
-                self.error.emit(f"写入脚本失败：{e}")
-                return
 
             env = os.environ.copy()
             env.setdefault("PYTHONPATH", env.get("PYTHONPATH", ""))
@@ -2380,40 +2509,96 @@ class ScraperWorker(QThread):
             env["SCRAPER_OUTPUT_PATH"] = str(output_path)
             env["PYTHONIOENCODING"] = "utf-8"
 
-            self.progress.emit("正在执行爬虫脚本…")
-            try:
-                proc = subprocess.run(
-                    [sys.executable, str(script_path)],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=td,
-                    env=env,
-                    timeout=180,
-                )
-            except Exception as e:
-                self.error.emit(f"执行爬虫失败：{e}")
-                return
+            for attempt in range(max_attempts):
+                if attempt == 0:
+                    self.progress.emit("正在生成爬虫脚本…")
+                else:
+                    self.progress.emit(f"正在请求模型修复脚本（第{attempt + 1}次尝试）…")
 
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
-            if proc.returncode != 0:
-                err_text = stderr or stdout or "未知错误"
-                self.error.emit(f"爬虫脚本执行失败：{err_text}")
-                return
+                try:
+                    response = client.chat.completions.create(
+                        model="deepseek-chat",
+                        temperature=0.2,
+                        messages=messages,
+                    )
+                except Exception as e:
+                    self.error.emit(str(e))
+                    return
 
-            if not output_path.exists():
-                self.error.emit("爬虫脚本未生成任何数据文件")
-                return
+                content = ""
+                try:
+                    content = (response.choices[0].message.content or "").strip()
+                except Exception:
+                    self.error.emit("模型返回内容为空")
+                    return
 
-            try:
-                df = pd.read_csv(output_path)
-            except Exception as e:
-                self.error.emit(f"读取爬取结果失败：{e}")
-                return
+                if content.startswith("```"):
+                    parts = content.splitlines()
+                    content = "\n".join(parts[1:-1]) if len(parts) >= 2 else content
 
-        self.data_ready.emit(df, self.url)
+                code = content.strip()
+                if not code:
+                    self.error.emit("未获取到有效的爬虫代码")
+                    return
+
+                try:
+                    script_path.write_text(code, encoding="utf-8")
+                except Exception as e:
+                    self.error.emit(f"写入脚本失败：{e}")
+                    return
+
+                self.progress.emit("正在执行爬虫脚本…")
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(script_path)],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        cwd=td,
+                        env=env,
+                        timeout=180,
+                    )
+                except Exception as e:
+                    last_error = f"执行爬虫失败：{e}"
+                    error_for_prompt = last_error
+                else:
+                    stdout = (proc.stdout or "").strip()
+                    stderr = (proc.stderr or "").strip()
+                    if proc.returncode == 0 and output_path.exists():
+                        try:
+                            df = pd.read_csv(output_path)
+                        except Exception as e:
+                            last_error = f"读取爬取结果失败：{e}"
+                            error_for_prompt = last_error
+                        else:
+                            self.data_ready.emit(df, self.url)
+                            return
+                    else:
+                        if proc.returncode != 0:
+                            last_error = stderr or stdout or "未知错误"
+                        elif not output_path.exists():
+                            last_error = "脚本执行完成但未生成CSV文件"
+                        else:
+                            last_error = stderr or stdout or "未知错误"
+                        error_for_prompt = stderr or stdout or last_error
+
+                if attempt == max_attempts - 1:
+                    break
+
+                condensed_error = summarize_error(error_for_prompt)
+                prompt_error = error_for_prompt if len(error_for_prompt) <= 1500 else error_for_prompt[:1500] + "…"
+                messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "脚本执行失败。错误摘要："
+                        f"{condensed_error}\n详细日志：{prompt_error}\n"
+                        "请基于上述代码修复问题，并继续遵守所有约束，直到成功导出CSV文件。"
+                    ),
+                })
+
+        self.error.emit(f"爬虫生成失败：{last_error or '未知错误'}")
 
 
 class ScraperDialog(QDialog):
@@ -2421,6 +2606,13 @@ class ScraperDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("从网页获取数据")
         layout = QVBoxLayout(self)
+        notice = QLabel(
+            "提示：当前功能主要适用于结构稳定的静态或半静态网页。"
+            "若页面依赖复杂的JS交互、登录或反爬机制，脚本可能失败；未来将考虑接入 Selenium/Playwright 等浏览器自动化方案。"
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet("color: #94a3b8;")
+        layout.addWidget(notice)
         layout.addWidget(QLabel("目标网址:"))
         self.url_edit = QLineEdit()
         layout.addWidget(self.url_edit)
@@ -2499,6 +2691,24 @@ class DataReporterWidget(QWidget):
 
         instruction_group = QGroupBox("分析需求")
         instruction_layout = QVBoxLayout(instruction_group)
+        presets_layout = QHBoxLayout()
+        presets_label = QLabel("快速指令：")
+        presets_label.setStyleSheet("color: #94a3b8;")
+        presets_layout.addWidget(presets_label)
+        preset_configs = [
+            ("销售分析", "请梳理各产品线的销售额与利润贡献，输出同比/环比趋势、Top5品类以及关键驱动因素。"),
+            ("用户画像", "请分析主要客户群的年龄、地区、消费频次等结构特征，并给出差异化运营建议。"),
+            ("财务监控", "请输出收入、成本、毛利率等核心指标的趋势分析，并标注异常波动与可能原因。"),
+        ]
+        self.preset_buttons = []
+        for title, text in preset_configs:
+            btn = QPushButton(title)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, t=text: self._apply_preset_instruction(t))
+            presets_layout.addWidget(btn)
+            self.preset_buttons.append(btn)
+        presets_layout.addStretch()
+        instruction_layout.addLayout(presets_layout)
         self.instruction_edit = QPlainTextEdit()
         self.instruction_edit.setPlaceholderText("例如：分析各产品销售额占比，并给出关键洞察。")
         self.instruction_edit.setMinimumHeight(120)
@@ -2648,6 +2858,10 @@ class DataReporterWidget(QWidget):
     def _report_finished(self):
         self.btn_generate.setEnabled(True)
         self.report_worker = None
+
+    def _apply_preset_instruction(self, text: str):
+        self.instruction_edit.setPlainText(text)
+        self._set_status("已应用预设分析模板，可直接生成或继续编辑。")
 
     def _set_status(self, text: str):
         self.status_label.setText(text)
