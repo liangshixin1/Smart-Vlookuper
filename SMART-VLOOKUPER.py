@@ -2362,32 +2362,41 @@ class ReportGenerationWorker(QThread):
         fingerprint_text = generate_dataframe_fingerprint(self.dataframe)
         system_prompt = textwrap.dedent(
             """
-            你是一位资深数据分析师，需要基于提供的结构化数据生成可视化分析报告。
-            请严格编写可直接运行的 Python 脚本：
-            1. 使用 pandas 读取环境变量 REPORT_CSV_PATH 指向的 UTF-8 CSV 数据文件。
-            2. 优先使用 pyecharts 生成交互式图表；如环境不可用，可退回 matplotlib 并将图片转为 Base64 内嵌至 HTML。
-            3. 生成包含标题、摘要、洞察段落和图表的完整 HTML 字符串，并通过 print(html_string) 输出。
-            4. 禁止写入除标准输出外的任何文件，也不要尝试联网或安装依赖。
-            5. 代码必须自包含，包含必要的 import 与数据处理逻辑。
-            6. 运行环境已预装 pandas、numpy、pyecharts、matplotlib，请勿导入其他第三方库或执行安装命令。
+            你是一位资深的数据分析师与前端可视化工程师。你的任务是读取结构化数据后，生成信息丰富且具有响应式布局的 HTML 数据分析报告。
+            编写 Python 脚本时请严格遵循以下约束：
+            1. 仅允许导入 pandas、numpy（如需）、json、math、statistics、datetime、textwrap 及其他 Python 标准库；严禁使用 pyecharts、matplotlib 或任何额外的第三方可视化库。
+            2. 必须从环境变量 REPORT_CSV_PATH 指向的 UTF-8 CSV 文件加载完整数据集，并在任何计算前通过 pd.to_numeric(..., errors="coerce") 或 pd.to_datetime(..., errors="coerce") 做好类型清洗，同时妥善处理缺失值。
+            3. 生成的 HTML 需包含 <html>、<head>、<body> 等完整结构，在 <head> 中编写内联 CSS，确保布局在桌面端与移动端均表现良好（例如限制内容最大宽度、使用 flex 栅格、响应式卡片等）。
+            4. 所有图表必须使用原生 ECharts JavaScript 库渲染，在 HTML 中引入 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>，并由 Python 将数据转换为 JSON 串嵌入脚本，使用 echarts.init(...) 和 setOption(...) 完成渲染。
+            5. 每个图表初始化后需注册 window.addEventListener('resize', chart.resize) 保持响应式，图表容器 div 需设置明确高度并自动适应父容器宽度。
+            6. 除图表外，请提供文字洞察、关键指标卡片或汇总表格等辅助信息，帮助读者快速理解数据结论。
+            7. 若某个洞察所需字段在清洗后为空，可构造少量示例数据用于演示，并在标题或描述中明确标注“示例数据”；真实数据可用时必须优先展示真实结果。
+            8. 最终脚本必须且只能 print(完整 HTML 字符串)，禁止写入文件或输出其他调试信息。
+            9. 返回的内容必须是纯 Python 源码，严禁包含 Markdown 代码块标记（例如 ```python）或额外说明文字。
             """
         ).strip()
         user_prompt = textwrap.dedent(
             f"""
-            [数据结构]
-            列: {column_text}
-            总记录数: {rows} 行，{cols} 列
+            [数据概览]
+            - 列名: {column_text}
+            - 总行数: {rows}
+            - 总列数: {cols}
 
-            [脱敏样本CSV]
+            [脱敏样本 CSV]
             {preview_text}
 
-            [数据指纹]
+            [数据画像]
             {fingerprint_text}
 
             [分析需求]
-            {self.instruction or '请给出全面的数据洞察、关键指标与图表建议。'}
+            {self.instruction or '请基于该数据集完成一次全面的探索性分析，找出主要趋势、异常与改进建议。'}
 
-            请按照以上约束生成 Python 代码，确保最终仅打印 HTML 字符串。
+            交付要求：
+            - 至少构建三个核心洞察点，并为每个洞察提供相应的文字说明。
+            - 生成不少于两个的 ECharts 可视化图表（如趋势、对比或占比），保证容器在不同屏幕尺寸下的可读性。
+            - HTML 正文需包含主标题、概述段落、要点列表以及总结部分。
+
+            请在遵守系统提示的全部约束下生成 Python 脚本，并仅打印最终 HTML 字符串。
             """
         ).strip()
         return system_prompt, user_prompt
@@ -2570,24 +2579,35 @@ class ScraperWorker(QThread):
 
         system_prompt = textwrap.dedent(
             """
-            你是一名善于编写可靠网络爬虫的工程师。
-            请编写Python脚本并遵守以下约束：
-            1. 通过环境变量 SCRAPER_TARGET_URL 获取目标网页，使用 requests 请求并设置常见浏览器 User-Agent。
-            2. 运行环境已预装 requests、beautifulsoup4、lxml、pandas，请勿导入或安装其他第三方库。
-            3. 将采集到的结构化结果写入 UTF-8 CSV 文件，路径由环境变量 SCRAPER_OUTPUT_PATH 指定。
-            4. 避免无限循环和与任务无关的操作，必要日志可使用 print 输出。
+            你是一名资深的网络爬虫工程师，需要根据页面结构编写可直接运行的 Python 脚本来提取结构化数据。
+            编写脚本时请严格遵循以下规范：
+            1. 仅可使用 requests、os、sys、time、re、json、pandas 以及 bs4 中的 BeautifulSoup（含 Python 标准库）；禁止安装或导入其他第三方库。
+            2. 必须从环境变量 SCRAPER_TARGET_URL 读取目标地址，使用 requests.get 发起请求，设置常见浏览器 User-Agent、合理的超时与异常处理。必要时在失败后打印错误并安全退出。
+            3. 使用 BeautifulSoup('html.parser' 或 'lxml') 对响应进行解析，准确定位用户需求涉及的 DOM 节点，并在提取每个字段前判断元素是否存在或使用 try/except 捕获异常。
+            4. 将提取的记录存入列表后构建 pandas.DataFrame，并通过 df.to_csv(os.environ['SCRAPER_OUTPUT_PATH'], index=False, encoding='utf-8-sig') 写入结果。
+            5. 可以使用适量的 print 输出执行进度或结果统计，但禁止输出 Markdown、堆栈跟踪或与任务无关的信息。
+            6. 返回的内容必须是纯 Python 源码，绝不允许出现 Markdown 代码块标记（例如 ```python）或说明性段落；建议封装 main() 函数并以 if __name__ == "__main__": main() 作为入口。
             """
         ).strip()
 
         user_prompt = textwrap.dedent(
             f"""
-            目标网址: {self.url}
-            用户需求: {self.instruction}
+            [目标网址]
+            {self.url}
 
-            [页面HTML快照]
+            [用户任务]
+            {self.instruction}
+
+            [页面 HTML 快照（截取）]
             {html_excerpt}
 
-            请基于上述真实HTML结构生成满足需求的Python脚本。
+            请仔细阅读上述 DOM 结构，明确数据所在标签和类名后再设计解析逻辑。
+            交付的脚本必须：
+            - 调用 requests.get 采集 SCRAPER_TARGET_URL，必要时在失败时退出并输出友好的错误信息；
+            - 使用 BeautifulSoup 遍历所有匹配条目，逐字段提取文本并在缺失时填充为空字符串；
+            - 汇总为 pandas.DataFrame 并写入 CSV 文件（路径由 SCRAPER_OUTPUT_PATH 指定），最后打印成功行数或提示语。
+
+            请输出满足以上要求的完整 Python 代码，且务必不要包含 Markdown 标记。
             """
         ).strip()
 
